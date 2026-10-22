@@ -1,0 +1,51 @@
+name: build-windows-exe
+
+# 没有 Windows 电脑时，用 GitHub 免费 Windows 运行器打包：
+# 把本仓库推到 GitHub → Actions → build-windows-exe → Run workflow
+# 构建完成后在该次运行的 Artifacts 里下载 Excel公式转数值-windows.zip
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装 PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+
+      - name: 校验脚本语法与核心引擎
+        run: |
+          python -m py_compile xlsx_deformula.py
+          python -c "import tkinter; print('tkinter OK')"
+
+      - name: 打包单文件 exe
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed `
+            --name "Excel公式转数值" --icon icon.ico `
+            --distpath dist --workpath build --specpath build `
+            xlsx_deformula.py
+
+      - name: 冒烟测试（exe 能启动）
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist\Excel公式转数值.exe" -PassThru
+          Start-Sleep -Seconds 8
+          if ($p.HasExited) { Write-Error "exe 启动后立即退出"; exit 1 }
+          Write-Host "exe 已启动并存活，进程 ID $($p.Id)"
+          Stop-Process -Id $p.Id -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Excel公式转数值-windows
+          path: dist/Excel公式转数值.exe
