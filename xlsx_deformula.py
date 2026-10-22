@@ -467,6 +467,14 @@ def run_gui():
 
 
 def main():
+    # PyInstaller --windowed 冻结环境下 stdout/stderr 可能是 None，
+    # 此时 print/write 会抛异常，统一重定向到 devnull。
+    for name in ('stdout', 'stderr'):
+        if getattr(sys, name, None) is None:
+            try:
+                setattr(sys, name, open(os.devnull, 'w', encoding='utf-8'))
+            except Exception:
+                pass
     args = [a for a in sys.argv[1:]]
     if args and args[0] in ('--cli', 'cli'):
         return run_cli(args[1:])

@@ -11,7 +11,9 @@
 |---|---|
 | `xlsx_deformula.py` | 主程序（图形界面 + 命令行两种用法，纯 Python 标准库，零第三方依赖） |
 | `一键打包exe.bat` | 在 Windows 上双击，自动装 PyInstaller 并生成单文件 exe |
-| `icon.ico` | 程序图标 |
+| `selftest.py` | 自检（造样例→转换→校验公式/数值/图片单元格/源文件不变），CI 与本地都能跑 |
+| `make_ico.py` | 由 `icon.png` 生成纯 BMP 条目的 `icon.ico`（PIL 默认写 PNG 条目，PyInstaller 嵌入时易报错） |
+| `icon.ico` / `icon.png` | 程序图标 |
 | `.github/workflows/build-exe.yml` | 没有 Windows 电脑时，用 GitHub Actions 云端打包 exe |
 | `README.md` | 本说明 |
 
@@ -115,3 +117,27 @@ pyinstaller --noconfirm --clean --onefile --windowed ^
 4. 处理前建议先留一份原文件（本工具不会改源文件，但值得养习惯）。
 5. 首次运行未签名的 exe，Windows SmartScreen 可能提示"未知发布者"，
    点"更多信息 → 仍要运行"；单文件模式偶尔被杀软误报，可改用 `--onedir`。
+
+
+---
+
+## 七、CI（GitHub Actions）打包失败排查记录
+
+2026-10 首次云端构建：**第 6 步"打包单文件 exe"失败**（后续步骤被跳过），
+并有 **Node.js 20 弃用警告**。已修复，要点如下：
+
+| 现象 | 原因 | 修法 |
+|---|---|---|
+| PyInstaller 步骤退出码 1 | Windows 运行器的 stdout 是**管道**，默认按 cp1252 编码；PyInstaller 日志里一旦出现中文路径（`--name Excel公式转数值`）就 `UnicodeEncodeError` 直接崩 | 工作流加 `PYTHONUTF8=1`、`PYTHONIOENCODING=utf-8`；内部包名改 ASCII（`XlsxFormulaToValue`），打包后再 `Copy-Item` 成中文名 |
+| 同上（另一处风险） | 用 PowerShell 反引号续写多行命令，参数易被截断，pyinstaller 收不到脚本名 | 改为 PowerShell 数组 `$common = @(...)` 单次调用，不用续行符 |
+| 图标嵌入失败风险 | PIL 生成的 ico 每个尺寸都是 **PNG 压缩条目**，PyInstaller 在 Windows 嵌入资源时容易报错 | 改用 `make_ico.py` 生成**纯 BMP 条目**的 ico；工作流仍保留"带图标失败→无图标重试"的自动回退 |
+| Node.js 20 弃用警告 | `checkout@v4`、`setup-python@v5`、`upload-artifact@v4` 都跑在 Node 20 上 | 升级到 `checkout@v5`、`setup-python@v6`、`upload-artifact@v5`（Node 24） |
+
+现在工作流共 11 步，失败点会明确停在某一步；新增两步质量闸门：
+
+- **引擎自检**：`python selftest.py`，不通过就不打包；
+- **冒烟测试**：用打包好的 exe 真跑一次 `--cli 样例.xlsx 输出.xlsx`，再用
+  `python selftest.py --verify` 校验产物——不仅证明"能打包"，还证明"打包出来的程序真能干活"。
+
+若仍失败：Actions 页面点开失败的那一步，把日志最后 30 行发出来即可；若怀疑图标，
+删掉工作流里 `--icon icon.ico` 那行也会自动走无图标路径。
