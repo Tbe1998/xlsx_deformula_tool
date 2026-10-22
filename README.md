@@ -132,7 +132,7 @@ pyinstaller --noconfirm --clean --onefile --windowed ^
 | 同上（另一处风险） | 用 PowerShell 反引号续写多行命令，参数易被截断，pyinstaller 收不到脚本名 | 改为 PowerShell 数组 `$common = @(...)` 单次调用，不用续行符 |
 | 图标嵌入失败风险 | PIL 生成的 ico 每个尺寸都是 **PNG 压缩条目**，PyInstaller 在 Windows 嵌入资源时容易报错 | 改用 `make_ico.py` 生成**纯 BMP 条目**的 ico；工作流仍保留"带图标失败→无图标重试"的自动回退 |
 | Node.js 20 弃用警告 | `checkout@v4`、`setup-python@v5`、`upload-artifact@v4` 都跑在 Node 20 上 | 升级到 `checkout@v5`、`setup-python@v6`、`upload-artifact@v5`（Node 24） |
-| 第二次仍失败：PyInstaller 退出码 1，自检已通过，报错落在日志靠后的 "Building EXE from EXE-00.toc" 阶段 | Windows 运行器的 **Defender 实时防护锁住正在写入的 exe**（`[WinError 5] Access is denied`）；单文件模式要把整个包追加进 exe 尾部，最容易撞上 | ① 构建前把工作目录加入 Defender 排除项；② 打包改**多套配置依次尝试**（onefile → onefile 重试 → 带图标 → onedir），任一套成功即通过；③ 每套日志写进运行页面 Summary 并作为 artifact 留存；④ PyInstaller 固定用已验证版本 6.22.3，失败再退回最新版 |
+| 第二次仍失败：PyInstaller 退出码 1，自检已通过，报错落在日志靠后的 "Building EXE from EXE-00.toc" 阶段 | Windows 运行器的 **Defender 实时防护锁住正在写入的 exe**（`[WinError 5] Access is denied`）；单文件模式要把整个包追加进 exe 尾部，最容易撞上 | ① 构建前把工作目录加入 Defender 排除项；② 打包改**多套单文件配置依次尝试**（onefile → onefile 重试 → 带图标 → `--noupx`），**只用退出码 0 且产物为文件的那一套**；③ 每套日志写进运行页面 Summary 并作为 artifact 留存；④ PyInstaller 固定用已验证版本 6.22.3，失败再退回最新版 |
 | 看不到失败原因 | 日志下载接口需要仓库 admin 权限（403） | 每套尝试的最后 80 行直接写进 `$GITHUB_STEP_SUMMARY`，运行页面 Summary 标签页公开可读，不需要下载日志 |
 
 现在工作流共 11 步，失败点会明确停在某一步；新增两步质量闸门：
@@ -143,3 +143,29 @@ pyinstaller --noconfirm --clean --onefile --windowed ^
 
 若仍失败：Actions 页面点开失败的那一步，把日志最后 30 行发出来即可；若怀疑图标，
 删掉工作流里 `--icon icon.ico` 那行也会自动走无图标路径。
+
+
+---
+
+## 八、云端打包的硬性约定与任务摘要
+
+工作流（`.github/workflows/build-exe.yml`）现在只接受**单文件产物**：
+
+1. 依次尝试 4 套 `--onefile` 配置，逐套记录 `pyinstaller` 的**退出码**；
+2. 判定成功的条件同时满足三条：**退出码 0** + `dist/XlsxFormulaToValue.exe` 是**文件** +
+   `dist/XlsxFormulaToValue/` **目录不存在**（一旦出现目录即判失败，符合"只输出单个文件"的要求）；
+3. 命中后只保留一个文件 `dist/Excel公式转数值.exe`（ASCII 中间产物会被删掉），
+   Artifact 里也只有这一个 exe；
+4. 全部配置都失败时，用 `::error::` 输出工作流命令错误注解并让步骤失败。
+
+任务摘要按 GitHub 官方 workflow commands 文档，在**运行时**向 `$GITHUB_STEP_SUMMARY`
+追加 Markdown 生成（[文档](https://docs.github.com/actions/using-workflows/workflow-commands-for-github-actions#adding-a-job-summary)），内容包括：
+
+- 运行器 / 提交 SHA / Python 版本 / stdout 编码 / 文件系统编码 / C 盘可用空间；
+- Defender 排除项是否设置成功；
+- **每套配置的退出码、是否有单文件产物、是否误建目录、结论**（Markdown 表格）；
+- 失败配置的日志尾部 80 行（折叠在 `<details>` 里）；
+- 冒烟测试结果（单文件 exe 实跑 `--cli` 并校验产物）；
+- 收尾的运行结果与产物要求。
+
+因此即使失败，也不需要下载日志：打开该次运行的 **Summary** 标签页即可看到全部退出码与报错。

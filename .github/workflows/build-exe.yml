@@ -1,22 +1,27 @@
 name: build-windows-exe
 
-# Windows 云端打包。仓库 → Actions → build-windows-exe → Run workflow
-# 产物：Artifacts 里的 Excel公式转数值-windows.zip
+# Windows 云端打包（只产出单文件 exe，不产生目录）。
+# 仓库 → Actions → build-windows-exe → Run workflow
+# 产物：Artifacts 里的 Excel公式转数值-windows.zip（内含单个 Excel公式转数值.exe）
 #
-# 修复记录
-# ---------
-# 第 1 次失败（第 6 步 PyInstaller 退出码 1）：
-#   1. Windows 运行器 stdout 走管道时默认 cp1252，PyInstaller 打印中文路径即 UnicodeEncodeError
-#      → 全流程强制 PYTHONUTF8/PYTHONIOENCODING，内部包名用 ASCII，打包后再改中文名；
-#   2. PowerShell 反引号续行会截断参数 → 改数组一次调用；
-#   3. 图标 ico 条目原为 PNG 压缩 → 改用纯 BMP 条目（make_ico.py），并保留无图标回退。
-# 第 2 次失败（第 8 步 PyInstaller 退出码 1，自检已通过，日志靠后的 EXE 拼装阶段）：
-#   4. Defender 实时防护会锁住正在写入的 exe（[WinError 5] Access is denied），
-#      报错发生在 "Building EXE from EXE-00.toc" 阶段 → 先把工作目录加入 Defender 排除项；
-#   5. 打包改为「多套配置依次尝试」：标准 onefile → 带图标 onefile → onedir 目录模式，
-#      哪套成功用哪套（onedir 不往 exe 尾部追加数据，最不容易被防护干扰）；
-#   6. 每次尝试的完整日志写入 $GITHUB_STEP_SUMMARY（失败也能在运行页面直接看到），
-#      并作为 artifact 留存。
+# 约定（本工作流的硬性要求）
+# ---------------------------------------------------------------------------
+# 1. 只接受 **单文件（--onefile）** 产物：成功条件 = 退出码 0 且 dist 下产出
+#    XlsxFormulaToValue.exe 这个文件，并且不出现同名目录（一旦出现目录即判定失败）；
+# 2. 依次尝试多套 onefile 配置，记录每一套的退出码，**只用退出码 0 的那一套**的产物；
+# 3. 任务摘要用 GitHub Actions 的 job summary（$GITHUB_STEP_SUMMARY）在运行时生成，
+#    写法遵循官方文档：向 $GITHUB_STEP_SUMMARY 追加 Markdown。
+#    https://docs.github.com/actions/using-workflows/workflow-commands-for-github-actions#adding-a-job-summary
+#
+# 历史修复记录
+# ---------------------------------------------------------------------------
+# ① Windows 运行器 stdout 走管道时默认 cp1252，PyInstaller 打印中文路径即 UnicodeEncodeError
+#    → 强制 PYTHONUTF8/PYTHONIOENCODING，内部包名用 ASCII，打包后再改中文名；
+# ② PowerShell 反引号续行会截断参数 → 改为数组一次调用；
+# ③ 图标 ico 原为 PNG 压缩条目 → 改用纯 BMP 条目（make_ico.py）；
+# ④ Defender 实时防护锁住正在写入的 exe（[WinError 5] Access is denied），
+#    报错落在 "Building EXE from EXE-00.toc" 阶段 → 构建前把工作目录加入排除项；
+# ⑤ 换配置重试（onefile → 重试 → 带图标），未成功前不会留下任何目录产物。
 
 on:
   workflow_dispatch:
@@ -39,25 +44,40 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: 环境信息
+      - name: 环境信息（写入任务摘要）
+        shell: pwsh
         run: |
-          python -V
-          python -c "import sys; print('stdout encoding =', sys.stdout.encoding); print('fs encoding =', sys.getfilesystemencoding())"
-          Get-PSDrive C | Select-Object Used, Free | Format-List
+          $summary = $env:GITHUB_STEP_SUMMARY
+          $pyver = (python -V 2>&1)
+          $enc = (python -c "import sys; print(sys.stdout.encoding)" 2>&1)
+          $fsenc = (python -c "import sys; print(sys.getfilesystemencoding())" 2>&1)
+          $free = (Get-PSDrive C | Select-Object -ExpandProperty Free)
+
+          Add-Content -Path $summary -Value "## Excel 公式转数值工具 — Windows 打包"
+          Add-Content -Path $summary -Value ""
+          Add-Content -Path $summary -Value "| 项目 | 值 |"
+          Add-Content -Path $summary -Value "| --- | --- |"
+          Add-Content -Path $summary -Value "| 运行器 | ``windows-latest`` |"
+          Add-Content -Path $summary -Value "| 提交 | ``$env:GITHUB_SHA`` |"
+          Add-Content -Path $summary -Value "| Python | $pyver |"
+          Add-Content -Path $summary -Value "| stdout 编码 | $enc |"
+          Add-Content -Path $summary -Value "| 文件系统编码 | $fsenc |"
+          Add-Content -Path $summary -Value ("| C 盘可用 | {0:N1} GB |" -f ($free / 1GB))
+          Add-Content -Path $summary -Value ""
           Get-ChildItem -Name
 
       - name: 安装 PyInstaller
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          # 优先用已验证通过的版本，失败再退回最新版
+          # 优先使用已验证版本，失败再退回最新版
           python -m pip install "pyinstaller==6.22.3"
           if ($LASTEXITCODE -ne 0) {
             Write-Host "固定版本安装失败，退回最新版"
             python -m pip install pyinstaller
           }
           pyinstaller --version
-          python -c "import PyInstaller, sys; print('PyInstaller', PyInstaller.__version__, 'on Python', sys.version)" 
+          python -c "import PyInstaller, sys; print('PyInstaller', PyInstaller.__version__, '| Python', sys.version.split()[0])"
 
       - name: 关闭 Defender 对工作目录的实时扫描
         shell: pwsh
@@ -66,8 +86,10 @@ jobs:
           try {
             Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE -ErrorAction Stop
             Write-Host "已把 $env:GITHUB_WORKSPACE 加入 Defender 排除项"
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- Defender 排除项：已添加 `"$env:GITHUB_WORKSPACE`""
           } catch {
-            Write-Host "无法修改 Defender 设置（不影响继续构建）: $($_.Exception.Message)"
+            Write-Host "无法修改 Defender 设置（不影响继续构建）：$($_.Exception.Message)"
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- Defender 排除项：未能设置（$($_.Exception.Message)），继续构建"
           }
 
       - name: 校验脚本语法与 tkinter
@@ -78,94 +100,144 @@ jobs:
       - name: 引擎自检（公式转数值/图片保留/源文件不变）
         run: python selftest.py
 
-      # 依次尝试多套打包配置，任一成功即通过；每套日志都留存
-      - name: 打包 exe（多套配置依次尝试）
+      # 只跑单文件配置；逐套记录退出码，取退出码 0 且产出为文件（无同名目录）的那一套
+      - name: 打包单文件 exe（逐套尝试并记录退出码）
         id: build
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
-          $name = $env:PYINSTALLER_NAME
+          $name    = $env:PYINSTALLER_NAME
           $summary = $env:GITHUB_STEP_SUMMARY
+
+          # 全部是 --onefile 配置，绝不使用 --onedir
           $attempts = @(
-            @{ id = 'onefile';       params = @('--onefile','--windowed') },
-            @{ id = 'onefile-retry'; params = @('--onefile','--windowed') },
-            @{ id = 'onefile-icon';  params = @('--onefile','--windowed','--icon','icon.ico') },
-            @{ id = 'onedir';        params = @('--onedir','--windowed') }
+            @{ id = 'onefile';         extra = @() },
+            @{ id = 'onefile-retry';   extra = @() },
+            @{ id = 'onefile-icon';    extra = @('--icon','icon.ico') },
+            @{ id = 'onefile-noupx';   extra = @('--noupx') }
           )
 
-          Add-Content -Path $summary -Value "## 打包尝试记录"
           Add-Content -Path $summary -Value ""
-          $ok = $false
+          Add-Content -Path $summary -Value "## 打包尝试记录（仅单文件配置）"
+          Add-Content -Path $summary -Value ""
+          Add-Content -Path $summary -Value "| # | 配置 | 退出码 | 产物文件 | 误建目录 | 结论 |"
+          Add-Content -Path $summary -Value "| --- | --- | --- | --- | --- | --- |"
+
+          Remove-Item build_mode.txt,build_success.log -Force -ErrorAction SilentlyContinue
+          $okId = $null
+          $idx = 0
           foreach ($a in $attempts) {
+            $idx++
             Remove-Item -Recurse -Force dist,build -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 2
-            $log = "build_$($a.id).log"
-            $argv = @('--noconfirm','--clean','--name',$name) + $a.params + @('xlsx_deformula.py')
-            Write-Host ">>> 尝试 [$($a.id)]: pyinstaller $($argv -join ' ')"
+
+            $log  = "build_$($a.id).log"
+            $argv = @('--noconfirm','--clean','--onefile','--windowed','--name',$name) + $a.extra + @('xlsx_deformula.py')
+            Write-Host ">>> [$idx] 尝试 $($a.id): pyinstaller $($argv -join ' ')"
             & pyinstaller @argv 2>&1 | Tee-Object -FilePath $log
             $code = $LASTEXITCODE
-            $hasExe = Test-Path "dist/$name.exe"
-            $hasDir = Test-Path "dist/$name/$name.exe"
-            Write-Host "    退出码=$code  onefile产物=$hasExe  onedir产物=$hasDir"
-            Add-Content -Path $summary -Value "### 尝试 [$($a.id)] 退出码 $code / onefile=$hasExe / onedir=$hasDir"
-            if ($code -eq 0 -and ($hasExe -or $hasDir)) {
-              $ok = $true
-              "mode=$($a.id)" | Out-File -FilePath build_mode.txt -Encoding utf8
+
+            $exe = "dist/$name.exe"
+            $hasExe = (Test-Path $exe -PathType Leaf)
+            $hasDir = (Test-Path "dist/$name" -PathType Container)
+            $pass   = ($code -eq 0 -and $hasExe -and -not $hasDir)
+
+            $verdict = '❌ 退出码非 0'
+            if ($pass)            { $verdict = '✅ 采用' }
+            elseif ($hasDir)      { $verdict = '❌ 产生了目录（不符合只输出单文件的要求）' }
+            elseif (-not $hasExe) { $verdict = '❌ 无单文件产物' }
+            Add-Content -Path $summary -Value "| $idx | ``$($a.id)`` | $code | $hasExe | $hasDir | $verdict |"
+            Write-Host "    退出码=$code 产物文件=$hasExe 目录=$hasDir => $verdict"
+
+            if ($pass) {
+              $okId = $a.id
               break
             }
-            Add-Content -Path $summary -Value "~~~"
+            Add-Content -Path $summary -Value ""
+            Add-Content -Path $summary -Value "<details><summary>[$($a.id)] 日志尾部 80 行</summary>"
+            Add-Content -Path $summary -Value ""
+            Add-Content -Path $summary -Value '~~~'
             Add-Content -Path $summary -Value (Get-Content $log -Tail 80 | Out-String)
-            Add-Content -Path $summary -Value "~~~"
+            Add-Content -Path $summary -Value '~~~'
+            Add-Content -Path $summary -Value ""
+            Add-Content -Path $summary -Value '</details>'
           }
 
-          if (-not $ok) {
-            Write-Error "全部打包配置均失败，详见本步骤日志与运行页面的 Summary"
-            exit 1
-          }
-          Get-ChildItem dist | Select-Object Name, Length | Format-Table -AutoSize
-
-      - name: 生成中文名产物并检查体积
-        shell: pwsh
-        run: |
-          $name = $env:PYINSTALLER_NAME
-          if (Test-Path "dist/$name.exe") {
-            Copy-Item "dist/$name.exe" "dist/Excel公式转数值.exe" -Force
-            $len = (Get-Item "dist/Excel公式转数值.exe").Length
-            Write-Host ("单文件 exe 大小: {0:N1} MB" -f ($len / 1MB))
-            if ($len -lt 5MB) { Write-Error "exe 体积异常"; exit 1 }
-            "kind=onefile" | Out-File -FilePath artifact_kind.txt -Encoding utf8
-          } elseif (Test-Path "dist/$name/$name.exe") {
-            Copy-Item "dist/$name" "dist/Excel公式转数值" -Recurse -Force
-            Copy-Item "dist/$name/$name.exe" "dist/Excel公式转数值/Excel公式转数值.exe" -Force
-            $len = (Get-Item "dist/Excel公式转数值/Excel公式转数值.exe").Length
-            Write-Host ("目录模式主程序大小: {0:N1} MB" -f ($len / 1MB))
-            "kind=onedir" | Out-File -FilePath artifact_kind.txt -Encoding utf8
-          } else {
-            Write-Error "找不到打包产物"
+          if (-not $okId) {
+            Add-Content -Path $summary -Value ""
+            Add-Content -Path $summary -Value "**结论：全部单文件配置均失败，未产出 exe。**"
+            Write-Output "::error title=打包失败::所有 --onefile 配置均未成功（详见任务摘要与 build_*.log）"
             exit 1
           }
 
-      - name: 冒烟测试（打包产物实跑一次）
+          # 记录退出码 0 的那一套，供后续步骤使用
+          "mode=$okId" | Out-File -FilePath build_mode.txt -Encoding utf8
+          Copy-Item $log build_success.log -Force -ErrorAction SilentlyContinue
+          Add-Content -Path $summary -Value ""
+          Add-Content -Path $summary -Value "**成功配置：``$okId``，退出码 0，产物：``dist/$name.exe``（单文件）**"
+          Write-Host "::notice title=打包成功::配置=$okId 退出码=0 产物=dist/$name.exe"
+          Get-ChildItem dist -File | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: 生成中文名单文件产物并校验
         shell: pwsh
         run: |
-          $kind = (Get-Content artifact_kind.txt) -replace 'kind=',''
-          if ($kind -eq 'onedir') { $exe = "dist/Excel公式转数值/Excel公式转数值.exe" }
-          else { $exe = "dist/Excel公式转数值.exe" }
+          $name    = $env:PYINSTALLER_NAME
+          $summary = $env:GITHUB_STEP_SUMMARY
+          $src = "dist/$name.exe"
+          if (-not (Test-Path $src -PathType Leaf)) {
+            Write-Output "::error title=缺少产物::dist/$name.exe 不存在"
+            exit 1
+          }
+          if (Test-Path "dist/$name" -PathType Container) {
+            Write-Output "::error title=产物不符::出现了目录 dist/$name，要求只输出单个文件"
+            exit 1
+          }
+          Copy-Item $src "dist/Excel公式转数值.exe" -Force
+          Remove-Item $src -Force          # 只保留中文名那一个文件
+          $len = (Get-Item "dist/Excel公式转数值.exe").Length
+          Write-Host ("单文件 exe 大小: {0:N1} MB" -f ($len / 1MB))
+          Add-Content -Path $summary -Value ""
+          Add-Content -Path $summary -Value ("- 产物：``dist/Excel公式转数值.exe``，{0:N1} MB（单文件，无目录）" -f ($len / 1MB))
+          if ($len -lt 5MB) {
+            Write-Output "::error title=体积异常::exe 小于 5MB，可能缺少运行库"
+            exit 1
+          }
+          # 保底：dist 下只允许这一个 exe
+          $extra = Get-ChildItem dist -File | Where-Object { $_.Name -ne 'Excel公式转数值.exe' }
+          if ($extra) { Write-Host ("dist 下其他文件（不上传）：" + (($extra | ForEach-Object Name) -join ', ')) }
+
+      - name: 冒烟测试（单文件产物实跑一次）
+        shell: pwsh
+        run: |
+          $summary = $env:GITHUB_STEP_SUMMARY
+          $exe = "dist/Excel公式转数值.exe"
           Write-Host "被测程序: $exe"
           python selftest.py --make-sample smoke.xlsx
           & $exe --cli smoke.xlsx smoke_out.xlsx
-          if ($LASTEXITCODE -ne 0) { Write-Error "exe 处理失败，退出码 $LASTEXITCODE"; exit 1 }
-          if (-not (Test-Path "smoke_out.xlsx")) { Write-Error "exe 没有生成输出文件"; exit 1 }
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            Add-Content -Path $summary -Value "- 冒烟测试：❌ exe 退出码 $code"
+            Write-Output "::error title=冒烟测试失败::exe 退出码 $code"
+            exit 1
+          }
+          if (-not (Test-Path "smoke_out.xlsx" -PathType Leaf)) {
+            Add-Content -Path $summary -Value "- 冒烟测试：❌ 未生成输出文件"
+            Write-Output "::error title=冒烟测试失败::未生成输出文件"
+            exit 1
+          }
           python selftest.py --verify smoke_out.xlsx
-          if ($LASTEXITCODE -ne 0) { Write-Error "产物校验失败"; exit 1 }
+          if ($LASTEXITCODE -ne 0) {
+            Add-Content -Path $summary -Value "- 冒烟测试：❌ 产物校验不通过"
+            Write-Output "::error title=冒烟测试失败::产物校验不通过"
+            exit 1
+          }
+          Add-Content -Path $summary -Value "- 冒烟测试：✅ 单文件 exe 实跑通过（公式转数值、图片单元格保留、源文件未改动）"
 
       - name: 上传产物
         uses: actions/upload-artifact@v5
         with:
           name: Excel公式转数值-windows
-          path: |
-            dist/Excel公式转数值.exe
-            dist/Excel公式转数值/**
+          path: dist/Excel公式转数值.exe
           if-no-files-found: error
 
       - name: 上传构建日志（无论成败）
@@ -175,6 +247,16 @@ jobs:
           name: build-logs
           path: |
             build_*.log
-            build/*.toc
             build/warn-*.txt
+            build_mode.txt
           if-no-files-found: warn
+
+      - name: 任务摘要收尾
+        if: always()
+        shell: pwsh
+        run: |
+          $summary = $env:GITHUB_STEP_SUMMARY
+          $status = if ('${{ job.status }}' -eq 'success') { '✅ 成功' } else { '❌ 失败' }
+          Add-Content -Path $summary -Value ""
+          Add-Content -Path $summary -Value "---"
+          Add-Content -Path $summary -Value "**运行结果：$status** ｜ 产物要求：单个 exe 文件（不建目录）｜ 源文件只读，处理结果另存"
