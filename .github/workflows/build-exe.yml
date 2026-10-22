@@ -8,20 +8,22 @@ name: build-windows-exe
 # ---------------------------------------------------------------------------
 # 1. 只接受 **单文件（--onefile）** 产物：成功条件 = 退出码 0 且 dist 下产出
 #    XlsxFormulaToValue.exe 这个文件，并且不出现同名目录（一旦出现目录即判定失败）；
-# 2. 依次尝试多套 onefile 配置，记录每一套的退出码，**只用退出码 0 的那一套**的产物；
-# 3. 任务摘要用 GitHub Actions 的 job summary（$GITHUB_STEP_SUMMARY）在运行时生成，
-#    写法遵循官方文档：向 $GITHUB_STEP_SUMMARY 追加 Markdown。
+# 2. 依次尝试多套 onefile 配置，记录每一套的退出码，只用退出码 0 的那一套的产物；
+# 3. 任务摘要用 GitHub Actions 的 job summary（$GITHUB_STEP_SUMMARY）在运行时生成。
 #    https://docs.github.com/actions/using-workflows/workflow-commands-for-github-actions#adding-a-job-summary
+# 4. 冒烟测试必须用 Start-Process -Wait -PassThru 调 exe：
+#    --windowed 产物是 GUI 子系统程序，直接 & 调用 PowerShell **不会等待**，
+#    会误判成"没有生成输出文件"。
 #
 # 历史修复记录
 # ---------------------------------------------------------------------------
-# ① Windows 运行器 stdout 走管道时默认 cp1252，PyInstaller 打印中文路径即 UnicodeEncodeError
-#    → 强制 PYTHONUTF8/PYTHONIOENCODING，内部包名用 ASCII，打包后再改中文名；
-# ② PowerShell 反引号续行会截断参数 → 改为数组一次调用；
-# ③ 图标 ico 原为 PNG 压缩条目 → 改用纯 BMP 条目（make_ico.py）；
-# ④ Defender 实时防护锁住正在写入的 exe（[WinError 5] Access is denied），
-#    报错落在 "Building EXE from EXE-00.toc" 阶段 → 构建前把工作目录加入排除项；
-# ⑤ 换配置重试（onefile → 重试 → 带图标），未成功前不会留下任何目录产物。
+# ① stdout 管道默认 cp1252 → 强制 UTF-8，内部包名用 ASCII，打包后改中文名；
+# ② PowerShell 反引号续行截断参数 → 改数组一次调用；
+# ③ 图标 ico 原为 PNG 条目 → 改纯 BMP 条目（make_ico.py）；
+# ④ Defender 锁 exe（[WinError 5]）→ 构建前加排除项；
+# ⑤ 只保留单文件配置，逐套记录退出码，成功条件三合一（退出码0 + 产物是文件 + 无同名目录）；
+# ⑥ 冒烟测试 & 同步误判 → 改 Start-Process -Wait -PassThru 并轮询输出文件；
+# ⑦ Node.js 20 弃用 → 全部动作升级到 Node 24 版本（checkout@v7 / setup-python@v7 / upload-artifact@v7）。
 
 on:
   workflow_dispatch:
@@ -38,9 +40,9 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -86,7 +88,7 @@ jobs:
           try {
             Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE -ErrorAction Stop
             Write-Host "已把 $env:GITHUB_WORKSPACE 加入 Defender 排除项"
-            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- Defender 排除项：已添加 `"$env:GITHUB_WORKSPACE`""
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- Defender 排除项：已添加 ``$env:GITHUB_WORKSPACE``"
           } catch {
             Write-Host "无法修改 Defender 设置（不影响继续构建）：$($_.Exception.Message)"
             Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- Defender 排除项：未能设置（$($_.Exception.Message)），继续构建"
@@ -170,7 +172,6 @@ jobs:
             exit 1
           }
 
-          # 记录退出码 0 的那一套，供后续步骤使用
           "mode=$okId" | Out-File -FilePath build_mode.txt -Encoding utf8
           Copy-Item $log build_success.log -Force -ErrorAction SilentlyContinue
           Add-Content -Path $summary -Value ""
@@ -202,39 +203,99 @@ jobs:
             Write-Output "::error title=体积异常::exe 小于 5MB，可能缺少运行库"
             exit 1
           }
-          # 保底：dist 下只允许这一个 exe
           $extra = Get-ChildItem dist -File | Where-Object { $_.Name -ne 'Excel公式转数值.exe' }
           if ($extra) { Write-Host ("dist 下其他文件（不上传）：" + (($extra | ForEach-Object Name) -join ', ')) }
 
+      # --windowed 产物是 GUI 子系统程序：直接 & 调用不会等待，必须 Start-Process -Wait
       - name: 冒烟测试（单文件产物实跑一次）
         shell: pwsh
         run: |
           $summary = $env:GITHUB_STEP_SUMMARY
-          $exe = "dist/Excel公式转数值.exe"
+          $exe = (Resolve-Path "dist/Excel公式转数值.exe" -ErrorAction Stop).Path
           Write-Host "被测程序: $exe"
+
           python selftest.py --make-sample smoke.xlsx
-          & $exe --cli smoke.xlsx smoke_out.xlsx
-          $code = $LASTEXITCODE
-          if ($code -ne 0) {
-            Add-Content -Path $summary -Value "- 冒烟测试：❌ exe 退出码 $code"
-            Write-Output "::error title=冒烟测试失败::exe 退出码 $code"
+          if (-not (Test-Path "smoke.xlsx" -PathType Leaf)) {
+            Add-Content -Path $summary -Value "- 冒烟测试：❌ 未能生成测试样例"
+            Write-Output "::error title=冒烟测试失败::未能生成测试样例 smoke.xlsx"
             exit 1
           }
-          if (-not (Test-Path "smoke_out.xlsx" -PathType Leaf)) {
-            Add-Content -Path $summary -Value "- 冒烟测试：❌ 未生成输出文件"
-            Write-Output "::error title=冒烟测试失败::未生成输出文件"
-            exit 1
+          Remove-Item smoke_out.xlsx,smoke_diag.xlsx,diag.log -Force -ErrorAction SilentlyContinue
+
+          $code = -1
+          $startErr = ''
+          try {
+            $p = Start-Process -FilePath $exe -ArgumentList @('--cli','smoke.xlsx','smoke_out.xlsx') `
+                               -WorkingDirectory (Get-Location).Path -Wait -PassThru
+            $code = $p.ExitCode
+            Write-Host "exe 退出码: $code"
+          } catch {
+            $startErr = $_.Exception.Message
+            Write-Host "启动失败: $startErr"
           }
-          python selftest.py --verify smoke_out.xlsx
-          if ($LASTEXITCODE -ne 0) {
-            Add-Content -Path $summary -Value "- 冒烟测试：❌ 产物校验不通过"
-            Write-Output "::error title=冒烟测试失败::产物校验不通过"
-            exit 1
+
+          # 轮询输出文件，最多等 20 秒（GUI 程序的文件写入与进程退出可能有毫秒级错位）
+          $deadline = (Get-Date).AddSeconds(20)
+          while (-not (Test-Path "smoke_out.xlsx" -PathType Leaf) -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 500
           }
-          Add-Content -Path $summary -Value "- 冒烟测试：✅ 单文件 exe 实跑通过（公式转数值、图片单元格保留、源文件未改动）"
+          $hasOut = (Test-Path "smoke_out.xlsx" -PathType Leaf)
+
+          if ($code -eq 0 -and $hasOut) {
+            python selftest.py --verify smoke_out.xlsx
+            if ($LASTEXITCODE -ne 0) {
+              Add-Content -Path $summary -Value "- 冒烟测试：❌ 产物校验不通过（公式/数值/图片单元格校验失败）"
+              Write-Output "::error title=冒烟测试失败::产物校验不通过"
+              exit 1
+            }
+            $size = (Get-Item "smoke_out.xlsx").Length
+            Add-Content -Path $summary -Value "- 冒烟测试：✅ 单文件 exe 实跑通过（退出码 0，输出 ${size} 字节，公式已转数值、图片单元格保留、源文件未改动）"
+            Write-Host "::notice title=冒烟测试通过::exe 退出码 0，输出 smoke_out.xlsx $size 字节"
+            exit 0
+          }
+
+          # ---- 失败诊断：临时构建一个 --console 版本，把真实报错抓出来写进摘要 ----
+          Add-Content -Path $summary -Value ""
+          Add-Content -Path $summary -Value "### 冒烟测试失败诊断"
+          Add-Content -Path $summary -Value ""
+          Add-Content -Path $summary -Value "- exe 退出码：``$code``；输出文件存在：``$hasOut``；启动异常：``$startErr``"
+          try {
+            Write-Host ">>> 构建 --console 诊断版本以取得报错输出"
+            & pyinstaller --noconfirm --clean --onefile --console --name diag `
+                --distpath diag --workpath diagbuild --specpath diagbuild xlsx_deformula.py 2>&1 |
+                Tee-Object -FilePath diag_build.log | Out-Null
+            if (Test-Path "diag/diag.exe") {
+              $dp = Start-Process -FilePath (Resolve-Path "diag/diag.exe").Path `
+                                  -ArgumentList @('--cli','smoke.xlsx','smoke_diag.xlsx') `
+                                  -WorkingDirectory (Get-Location).Path -Wait -PassThru `
+                                  -RedirectStandardOutput diag_stdout.txt -RedirectStandardError diag_stderr.txt
+              Write-Host "诊断版退出码: $($dp.ExitCode)"
+              Add-Content -Path $summary -Value "- 诊断版（--console）退出码：``$($dp.ExitCode)``"
+              foreach ($f in 'diag_stdout.txt','diag_stderr.txt') {
+                if (Test-Path $f) {
+                  Add-Content -Path $summary -Value ""
+                  Add-Content -Path $summary -Value ("<details><summary>$f</summary>")
+                  Add-Content -Path $summary -Value ""
+                  Add-Content -Path $summary -Value '~~~'
+                  Add-Content -Path $summary -Value (Get-Content $f -Tail 60 | Out-String)
+                  Add-Content -Path $summary -Value '~~~'
+                  Add-Content -Path $summary -Value "</details>"
+                }
+              }
+            } else {
+              Add-Content -Path $summary -Value "- 诊断版构建失败，见 diag_build.log"
+              Add-Content -Path $summary -Value '~~~'
+              Add-Content -Path $summary -Value (Get-Content diag_build.log -Tail 40 | Out-String)
+              Add-Content -Path $summary -Value '~~~'
+            }
+          } catch {
+            Add-Content -Path $summary -Value "- 诊断过程本身出错：``$($_.Exception.Message)``"
+          }
+          Write-Output "::error title=冒烟测试失败::exe 未成功运行或未生成输出文件（退出码 $code，输出文件=$hasOut）"
+          exit 1
 
       - name: 上传产物
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: Excel公式转数值-windows
           path: dist/Excel公式转数值.exe
@@ -242,13 +303,16 @@ jobs:
 
       - name: 上传构建日志（无论成败）
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: build-logs
           path: |
             build_*.log
             build/warn-*.txt
             build_mode.txt
+            diag_build.log
+            diag_stdout.txt
+            diag_stderr.txt
           if-no-files-found: warn
 
       - name: 任务摘要收尾

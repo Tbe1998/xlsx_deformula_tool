@@ -131,7 +131,8 @@ pyinstaller --noconfirm --clean --onefile --windowed ^
 | PyInstaller 步骤退出码 1 | Windows 运行器的 stdout 是**管道**，默认按 cp1252 编码；PyInstaller 日志里一旦出现中文路径（`--name Excel公式转数值`）就 `UnicodeEncodeError` 直接崩 | 工作流加 `PYTHONUTF8=1`、`PYTHONIOENCODING=utf-8`；内部包名改 ASCII（`XlsxFormulaToValue`），打包后再 `Copy-Item` 成中文名 |
 | 同上（另一处风险） | 用 PowerShell 反引号续写多行命令，参数易被截断，pyinstaller 收不到脚本名 | 改为 PowerShell 数组 `$common = @(...)` 单次调用，不用续行符 |
 | 图标嵌入失败风险 | PIL 生成的 ico 每个尺寸都是 **PNG 压缩条目**，PyInstaller 在 Windows 嵌入资源时容易报错 | 改用 `make_ico.py` 生成**纯 BMP 条目**的 ico；工作流仍保留"带图标失败→无图标重试"的自动回退 |
-| Node.js 20 弃用警告 | `checkout@v4`、`setup-python@v5`、`upload-artifact@v4` 都跑在 Node 20 上 | 升级到 `checkout@v5`、`setup-python@v6`、`upload-artifact@v5`（Node 24） |
+| **冒烟测试**报"未生成输出文件"（exe 其实正常） | `--windowed` 产物是 **GUI 子系统程序**，PowerShell 直接 `& $exe` **不会等待**，进程还没写完文件就检查了，`$LASTEXITCODE` 也是陈旧值 | 改用 `Start-Process -FilePath $exe -ArgumentList ... -Wait -PassThru` 取 `$p.ExitCode`，并对输出文件做最多 20 秒轮询；失败时临时构建一个 `--console` 版把真实 stderr 抓进摘要 |
+| Node.js 20 弃用警告 | `checkout@v4`、`setup-python@v5`、`upload-artifact@v4/v5` 仍跑在 Node 20 上 | 升级到当前 Node 24 版本：`checkout@v7`、`setup-python@v7`、`upload-artifact@v7`（输入参数不变，已核对 `action.yml`） |
 | 第二次仍失败：PyInstaller 退出码 1，自检已通过，报错落在日志靠后的 "Building EXE from EXE-00.toc" 阶段 | Windows 运行器的 **Defender 实时防护锁住正在写入的 exe**（`[WinError 5] Access is denied`）；单文件模式要把整个包追加进 exe 尾部，最容易撞上 | ① 构建前把工作目录加入 Defender 排除项；② 打包改**多套单文件配置依次尝试**（onefile → onefile 重试 → 带图标 → `--noupx`），**只用退出码 0 且产物为文件的那一套**；③ 每套日志写进运行页面 Summary 并作为 artifact 留存；④ PyInstaller 固定用已验证版本 6.22.3，失败再退回最新版 |
 | 看不到失败原因 | 日志下载接口需要仓库 admin 权限（403） | 每套尝试的最后 80 行直接写进 `$GITHUB_STEP_SUMMARY`，运行页面 Summary 标签页公开可读，不需要下载日志 |
 
@@ -169,3 +170,27 @@ pyinstaller --noconfirm --clean --onefile --windowed ^
 - 收尾的运行结果与产物要求。
 
 因此即使失败，也不需要下载日志：打开该次运行的 **Summary** 标签页即可看到全部退出码与报错。
+
+
+---
+
+## 九、冒烟测试（CI）的实现要点
+
+`--windowed` 打包出来的是 **GUI 子系统程序**，这一点会导致两个坑，工作流里都已处理：
+
+1. **不能用 `& $exe` 调用**：PowerShell 对 GUI 程序不阻塞等待，会立刻返回，
+   于是 `$LASTEXITCODE` 是上一命令的陈旧值、输出文件也可能还没落盘，误判成"没生成输出文件"。
+   正确写法：
+
+   ```powershell
+   $p = Start-Process -FilePath $exe -ArgumentList @('--cli','smoke.xlsx','smoke_out.xlsx') `
+                      -WorkingDirectory (Get-Location).Path -Wait -PassThru
+   $code = $p.ExitCode
+   ```
+
+2. **文件落盘与进程退出有毫秒级错位**：拿到退出码后再对 `smoke_out.xlsx` 轮询最多 20 秒。
+
+冒烟流程：造样例 → 单文件 exe 实跑 `--cli` → 校验退出码 → 校验输出文件 → `selftest.py --verify`
+校验产物（公式已转数值 / 图片单元格保留 / 源文件未改动）。任一步失败会自动**临时再构建一个
+`--console` 版本**跑同一命令，把 stdout/stderr 写进任务摘要 —— 因为 windowed 程序本身没有控制台输出，
+不这么做失败原因是不可见的。诊断版不进产物、只用于定位。
