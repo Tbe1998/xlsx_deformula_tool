@@ -20,7 +20,8 @@
 | `selftest.py` | 自检（造样例→转换→校验公式/数值/图片单元格/源文件不变，以及拖拽解析、历史记忆），CI 与本地都能跑 |
 | `make_ico.py` | 由 `icon.png` 生成纯 BMP 条目的 `icon.ico`（PIL 默认写 PNG 条目，PyInstaller 嵌入时易报错） |
 | `icon.ico` / `icon.png` | 程序图标 |
-| `.github/workflows/build-exe.yml` | 没有 Windows 电脑时，用 GitHub Actions 云端打包 exe |
+| `.github/workflows/build-exe.yml` | 云端打包**单文件 exe**（一个 exe，启动时自解压） |
+| `.github/workflows/build-exe-folder.yml` | 云端打包**文件夹产物**（exe + `_internal` 运行库，数百个文件） |
 | `README.md` | 本说明 |
 
 ---
@@ -234,3 +235,31 @@ pyinstaller --noconfirm --clean --onefile --windowed ^
   避免发布一个"看起来正常、其实拖不进去"的包。
 - 已知限制：拖拽文件在**提权运行的资源管理器**（管理员窗口）里拖进普通权限程序会被 Windows 拦，
   这是系统 UIPI 限制；以相同权限运行即可。
+
+
+---
+
+## 十一、两套云端打包工作流：单文件 vs 文件夹
+
+仓库里有两个工作流，产物形态不同，按需选一个跑（都在 Actions 页面手动 `Run workflow`）：
+
+| | `build-exe.yml` | `build-exe-folder.yml` |
+| --- | --- | --- |
+| PyInstaller 模式 | `--onefile` | `--onedir` |
+| 产物形态 | **1 个 exe**（约 11–12 MB） | **1 个文件夹**（主程序 + `_internal/`，约 450+ 文件、40–60 MB） |
+| Artifact 名称 | `Excel公式转数值-windows` | `Excel公式转数值-windows-文件夹`（另有 `-zip`） |
+| 启动速度 | 首次启动要自解压，慢 1–2 秒 | 直接启动，最快 |
+| 分发要求 | 单文件，随便拷 | **必须整个文件夹一起拷**，只拿 exe 无法运行 |
+| 杀软误报 | 相对容易触发（自解压特征） | 相对少 |
+
+### 文件夹模式工作流的判定与产物
+
+- 只用 `--onedir`，依次尝试 4 套配置（`onedir` → 重试 → 带图标 → `--noupx`）；
+- 成功条件三合一：`pyinstaller` 退出码 0 ＋ `dist/<名字>/` 是目录 ＋ 目录里有主程序 ＋
+  `_internal/` 内文件数 ≥ 10（证明是完整的多文件目录产物，不是空壳）；
+- 产物整理：把 `dist/XlsxFormulaToValue/` 改名为 **`dist/Excel公式转数值/`**，主程序改名为
+  `Excel公式转数值.exe`（**`_internal` 目录名不能动**，改了程序就找不到运行库）；
+- 校验：目录内文件数 ≥ 10、拖拽组件 `--check-dnd` 必须返回 0、目录产物实跑一次 `--cli` 并校验产物；
+- 上传两个 Artifact：`Excel公式转数值-windows-文件夹`（解压即得整个文件夹）和
+  `Excel公式转数值-windows-zip`（`Compress-Archive` 打好的 zip，根目录只有一个文件夹，拿去直接分发）；
+- 任务摘要同样运行时生成，包含每套配置的退出码、目录内文件数、总大小、冒烟测试结果。

@@ -1,0 +1,313 @@
+name: build-windows-exe-folder
+
+# 目录模式打包：产出一个**包含多个文件的文件夹**（exe + _internal 运行库），而不是单文件 exe。
+# 仓库 → Actions → build-windows-exe-folder → Run workflow
+# 产物（Artifacts）：
+#   · Excel公式转数值-windows-文件夹  → 解压即是那个文件夹，里面有 exe 和 _internal
+#   · Excel公式转数值-windows-zip     → 现成的 zip（可直接发给别人解压使用）
+#
+# 与单文件工作流（build-exe.yml）的区别
+# ---------------------------------------------------------------------------
+# · 本工作流只用 --onedir：产物是 dist/<名字>/ 目录，内含主程序 + _internal/ 运行库，
+#   数百个文件；启动快、占用可分散，但**必须整目录一起拷走**，不能只拿 exe。
+# · 单文件工作流用 --onefile：产物只有一个 exe（启动时会自解压到临时目录）。
+#
+# 判定成功的条件（三条同时满足）
+#   1. pyinstaller 退出码 0；
+#   2. dist/<名字>/ 是**目录**，且其中 <名字>.exe 是文件；
+#   3. 该目录内 _internal/ 存在且**文件数 ≥ 10**（证明真的是多文件目录产物）。
+#
+# 其它约定：任务摘要用 $GITHUB_STEP_SUMMARY 运行时生成；windowed 程序调用一律
+# Start-Process -Wait -PassThru（GUI 子系统不会被 & 阻塞等待）。
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+env:
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: 'utf-8'
+  PYTHONLEGACYWINDOWSSTDIO: '0'
+  PYINSTALLER_NAME: XlsxFormulaToValue
+  CN_NAME: Excel公式转数值
+
+jobs:
+  build-folder:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: 环境信息（写入任务摘要）
+        shell: pwsh
+        run: |
+          $summary = $env:GITHUB_STEP_SUMMARY
+          $pyver = (python -V 2>&1)
+          $free = (Get-PSDrive D | Select-Object -ExpandProperty Free)
+          Add-Content -Path $summary -Value "## Excel 公式转数值工具 — 目录（文件夹）模式打包"
+          Add-Content -Path $summary -Value ""
+          Add-Content -Path $summary -Value "| 项目 | 值 |"
+          Add-Content -Path $summary -Value "| --- | --- |"
+          Add-Content -Path $summary -Value "| 运行器 | ``windows-latest`` |"
+          Add-Content -Path $summary -Value "| 提交 | ``$env:GITHUB_SHA`` |"
+          Add-Content -Path $summary -Value "| Python | $pyver |"
+          Add-Content -Path $summary -Value "| 打包模式 | ``--onedir``（文件夹，多文件） |"
+          Add-Content -Path $summary -Value ("| 工作盘可用 | {0:N1} GB |" -f ($free / 1GB))
+          Add-Content -Path $summary -Value ""
+          Get-ChildItem -Name
+
+      - name: 安装 PyInstaller 与拖拽组件
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "pyinstaller==6.22.3" tkinterdnd2
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "固定版本安装失败，退回最新版"
+            python -m pip install pyinstaller tkinterdnd2
+          }
+          pyinstaller --version
+          python -c "import PyInstaller, sys; print('PyInstaller', PyInstaller.__version__, '| Python', sys.version.split()[0])"
+          python -c "import tkinterdnd2, os; print('tkinterdnd2 OK ->', os.path.dirname(tkinterdnd2.__file__))"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "::error title=缺少拖拽组件::tkinterdnd2 安装失败，产物将不支持拖拽"
+            exit 1
+          }
+
+      - name: 关闭 Defender 对工作目录的实时扫描
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          try {
+            Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE -ErrorAction Stop
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- Defender 排除项：已添加 ``$env:GITHUB_WORKSPACE``"
+          } catch {
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- Defender 排除项：未能设置（不影响构建）"
+          }
+
+      - name: 校验脚本语法与 tkinter
+        run: |
+          python -m py_compile xlsx_deformula.py
+          python -c "import tkinter; print('tkinter OK', tkinter.TkVersion)"
+
+      - name: 引擎自检（公式转数值/图片保留/拖拽解析/历史记忆）
+        run: python selftest.py
+
+      # 只用 --onedir；逐套记录退出码，成功需同时满足"退出码0 + 目录存在 + exe在目录内 + _internal 文件数≥10"
+      - name: 打包文件夹产物（逐套尝试并记录退出码）
+        id: build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $name    = $env:PYINSTALLER_NAME
+          $summary = $env:GITHUB_STEP_SUMMARY
+          $dir     = "dist/$name"
+          $inner   = "dist/$name/$name.exe"
+          $internal = "dist/$name/_internal"
+
+          $attempts = @(
+            @{ id = 'onedir';       extra = @('--collect-all','tkinterdnd2') },
+            @{ id = 'onedir-retry'; extra = @('--collect-all','tkinterdnd2') },
+            @{ id = 'onedir-icon';  extra = @('--collect-all','tkinterdnd2','--icon','icon.ico') },
+            @{ id = 'onedir-noupx'; extra = @('--collect-all','tkinterdnd2','--noupx') }
+          )
+
+          Add-Content -Path $summary -Value ""
+          Add-Content -Path $summary -Value "## 打包尝试记录（仅目录模式 --onedir）"
+          Add-Content -Path $summary -Value ""
+          Add-Content -Path $summary -Value "| # | 配置 | 退出码 | 目录 | 目录内 exe | _internal 文件数 | 结论 |"
+          Add-Content -Path $summary -Value "| --- | --- | --- | --- | --- | --- | --- |"
+
+          Remove-Item build_mode.txt -Force -ErrorAction SilentlyContinue
+          $okId = $null
+          $idx = 0
+          foreach ($a in $attempts) {
+            $idx++
+            Remove-Item -Recurse -Force dist,build -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+
+            $log  = "build_$($a.id).log"
+            $argv = @('--noconfirm','--clean','--onedir','--windowed','--name',$name) + $a.extra + @('xlsx_deformula.py')
+            Write-Host ">>> [$idx] 尝试 $($a.id): pyinstaller $($argv -join ' ')"
+            & pyinstaller @argv 2>&1 | Tee-Object -FilePath $log
+            $code = $LASTEXITCODE
+
+            $hasDir  = (Test-Path $dir -PathType Container)
+            $hasExe  = (Test-Path $inner -PathType Leaf)
+            $nInt    = 0
+            if (Test-Path $internal -PathType Container) {
+              $nInt = (Get-ChildItem $internal -Recurse -File | Measure-Object).Count
+            }
+            $pass = ($code -eq 0 -and $hasDir -and $hasExe -and $nInt -ge 10)
+
+            $verdict = '❌ 退出码非 0'
+            if ($pass)                 { $verdict = '✅ 采用（文件夹，多文件）' }
+            elseif (-not $hasDir)      { $verdict = '❌ 没有产出目录' }
+            elseif (-not $hasExe)      { $verdict = '❌ 目录里没有主程序 exe' }
+            elseif ($nInt -lt 10)      { $verdict = '❌ _internal 文件过少，疑似不是完整目录产物' }
+            Add-Content -Path $summary -Value "| $idx | ``$($a.id)`` | $code | $hasDir | $hasExe | $nInt | $verdict |"
+            Write-Host "    退出码=$code 目录=$hasDir exe=$hasExe _internal文件数=$nInt => $verdict"
+
+            if ($pass) { $okId = $a.id; break }
+
+            Add-Content -Path $summary -Value ""
+            Add-Content -Path $summary -Value "<details><summary>[$($a.id)] 日志尾部 80 行</summary>"
+            Add-Content -Path $summary -Value ""
+            Add-Content -Path $summary -Value '~~~'
+            Add-Content -Path $summary -Value (Get-Content $log -Tail 80 | Out-String)
+            Add-Content -Path $summary -Value '~~~'
+            Add-Content -Path $summary -Value "</details>"
+          }
+
+          if (-not $okId) {
+            Add-Content -Path $summary -Value ""
+            Add-Content -Path $summary -Value "**结论：全部目录模式配置均失败，未产出文件夹。**"
+            Write-Output "::error title=打包失败::所有 --onedir 配置均未成功（详见任务摘要与 build_*.log）"
+            exit 1
+          }
+
+          $files = Get-ChildItem $dir -Recurse -File
+          $total = ($files | Measure-Object -Property Length -Sum).Sum
+          "mode=$okId" | Out-File -FilePath build_mode.txt -Encoding utf8
+          Copy-Item $log build_success.log -Force -ErrorAction SilentlyContinue
+          Add-Content -Path $summary -Value ""
+          Add-Content -Path $summary -Value "**成功配置：``$okId``，退出码 0**"
+          Add-Content -Path $summary -Value ("- 产物目录：``$dir``，共 **{0} 个文件**，合计 {1:N1} MB" -f $files.Count, ($total/1MB))
+          Write-Host ("::notice title=打包成功::配置=$okId 目录={0} 文件数={1} 合计={2:N1}MB" -f $dir, $files.Count, ($total/1MB))
+          Get-ChildItem $dir | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: 改成中文目录名并校验结构
+        shell: pwsh
+        run: |
+          $name    = $env:PYINSTALLER_NAME
+          $cn      = $env:CN_NAME
+          $summary = $env:GITHUB_STEP_SUMMARY
+          $src     = "dist/$name"
+          $dst     = "dist/$cn"
+          if (-not (Test-Path $src -PathType Container)) {
+            Write-Output "::error title=缺少产物::目录 dist/$name 不存在"
+            exit 1
+          }
+          if (-not (Test-Path "$src/$name.exe" -PathType Leaf)) {
+            Write-Output "::error title=缺少主程序::dist/$name/$name.exe 不存在"
+            exit 1
+          }
+          Remove-Item -Recurse -Force $dst -ErrorAction SilentlyContinue
+          Move-Item $src $dst
+          # 主程序改成中文名（_internal 名字不能改，改名会导致程序找不到运行库）
+          Move-Item "$dst/$name.exe" "$dst/$cn.exe"
+
+          $files = Get-ChildItem $dst -Recurse -File
+          $total = ($files | Measure-Object -Property Length -Sum).Sum
+          if ($files.Count -lt 10) {
+            Write-Output "::error title=结构不符::目录内只有 $($files.Count) 个文件，不像完整的目录产物"
+            exit 1
+          }
+          Write-Host ("目录 {0}：{1} 个文件，合计 {2:N1} MB" -f $dst, $files.Count, ($total/1MB))
+          Write-Host "一级内容："
+          Get-ChildItem $dst | Select-Object Mode, Name, Length | Format-Table -AutoSize
+          Add-Content -Path $summary -Value ""
+          Add-Content -Path $summary -Value ("- 中文目录：``dist/$cn/``（主程序 ``$cn.exe`` + ``_internal/`` 运行库），共 **{0} 个文件**，{1:N1} MB" -f $files.Count, ($total/1MB))
+          Add-Content -Path $summary -Value "- 注意：``_internal`` 目录必须与 exe 一起分发，单独拷 exe 无法运行。"
+
+      - name: 校验拖拽组件已打进产物
+        shell: pwsh
+        run: |
+          $summary = $env:GITHUB_STEP_SUMMARY
+          $cn   = $env:CN_NAME
+          $exe  = (Resolve-Path "dist/$cn/$cn.exe" -ErrorAction Stop).Path
+          $p = Start-Process -FilePath $exe -ArgumentList @('--check-dnd') -Wait -PassThru
+          $code = $p.ExitCode
+          Write-Host "拖拽组件自检退出码: $code（0=可用，3=不可用）"
+          if ($code -eq 0) {
+            Add-Content -Path $summary -Value "- 拖拽组件：✅ 已打进产物（tkdnd 可用）"
+            Write-Host "::notice title=拖拽组件可用::产物内 tkdnd 正常"
+          } else {
+            Add-Content -Path $summary -Value "- 拖拽组件：❌ 缺失（退出码 $code）"
+            Write-Output "::error title=拖拽组件缺失::产物里没有 tkdnd（请检查 --collect-all tkinterdnd2）"
+            exit 1
+          }
+
+      - name: 冒烟测试（目录产物实跑一次）
+        shell: pwsh
+        run: |
+          $summary = $env:GITHUB_STEP_SUMMARY
+          $cn  = $env:CN_NAME
+          $exe = (Resolve-Path "dist/$cn/$cn.exe" -ErrorAction Stop).Path
+          Write-Host "被测程序: $exe"
+
+          python selftest.py --make-sample smoke.xlsx
+          if (-not (Test-Path "smoke.xlsx" -PathType Leaf)) {
+            Write-Output "::error title=冒烟测试失败::未能生成测试样例"
+            exit 1
+          }
+          Remove-Item smoke_out.xlsx -Force -ErrorAction SilentlyContinue
+
+          $p = Start-Process -FilePath $exe -ArgumentList @('--cli','smoke.xlsx','smoke_out.xlsx') `
+                             -WorkingDirectory (Get-Location).Path -Wait -PassThru
+          $code = $p.ExitCode
+          $deadline = (Get-Date).AddSeconds(20)
+          while (-not (Test-Path "smoke_out.xlsx" -PathType Leaf) -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+          }
+          if ($code -ne 0 -or -not (Test-Path "smoke_out.xlsx" -PathType Leaf)) {
+            Add-Content -Path $summary -Value "- 冒烟测试：❌ 退出码 $code，输出文件存在=$([bool](Test-Path 'smoke_out.xlsx'))"
+            Write-Output "::error title=冒烟测试失败::exe 未成功处理样例（退出码 $code）"
+            exit 1
+          }
+          python selftest.py --verify smoke_out.xlsx
+          if ($LASTEXITCODE -ne 0) {
+            Add-Content -Path $summary -Value "- 冒烟测试：❌ 产物校验不通过"
+            Write-Output "::error title=冒烟测试失败::产物校验不通过"
+            exit 1
+          }
+          Add-Content -Path $summary -Value "- 冒烟测试：✅ 目录产物实跑通过（公式已转数值、图片单元格保留、源文件未改动）"
+
+      - name: 压缩成 zip（便于直接分发）
+        shell: pwsh
+        run: |
+          $cn = $env:CN_NAME
+          $zip = "dist/$cn-windows-folder.zip"
+          Remove-Item $zip -Force -ErrorAction SilentlyContinue
+          Compress-Archive -Path "dist/$cn" -DestinationPath $zip -CompressionLevel Optimal
+          $len = (Get-Item $zip).Length
+          Write-Host ("zip 大小: {0:N1} MB" -f ($len / 1MB))
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ("- 附带 zip：``dist/$cn-windows-folder.zip``，{0:N1} MB" -f ($len / 1MB))
+
+      - name: 上传文件夹产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: Excel公式转数值-windows-文件夹
+          path: dist/Excel公式转数值/
+          if-no-files-found: error
+
+      - name: 上传 zip 产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: Excel公式转数值-windows-zip
+          path: dist/Excel公式转数值-windows-folder.zip
+          if-no-files-found: error
+
+      - name: 上传构建日志（无论成败）
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-logs-folder
+          path: |
+            build_*.log
+            build/warn-*.txt
+            build_mode.txt
+          if-no-files-found: warn
+
+      - name: 任务摘要收尾
+        if: always()
+        shell: pwsh
+        run: |
+          $summary = $env:GITHUB_STEP_SUMMARY
+          $status = if ('${{ job.status }}' -eq 'success') { '✅ 成功' } else { '❌ 失败' }
+          Add-Content -Path $summary -Value ""
+          Add-Content -Path $summary -Value "---"
+          Add-Content -Path $summary -Value "**运行结果：$status** ｜ 产物形态：**文件夹（多文件，exe + _internal）** ｜ 分发时须整个目录一起拷走"
