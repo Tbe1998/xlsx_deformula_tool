@@ -7,7 +7,8 @@
   1. 输出文件里没有残留的普通公式；
   2. 每个单元格的值与原缓存结果一致；
   3. 源文件字节级未被改动；
-  4. 内嵌图片单元格 (=DISPIMG) 的公式被原样保留。
+  4. 内嵌图片单元格 (=DISPIMG) 的公式被原样保留；
+  5. 拖拽路径解析（多文件、带空格、整个文件夹）与输出目录历史记忆正常。
 
 用法：python selftest.py
 """
@@ -136,6 +137,9 @@ def main():
         if 'xl/calcChain.xml' in z.namelist():
             fails.append("calcChain.xml 未移除")
 
+    # 拖拽解析 / 历史记忆
+    fails.extend(test_dropped_paths_and_history())
+
     # 输出路径保护：不允许覆盖源文件
     try:
         tool.convert(src, src)
@@ -153,6 +157,64 @@ def main():
         return 1
     print("\n自检通过：公式已转为数值、值一致、图片单元格保留、源文件未改动。")
     return 0
+
+
+def test_dropped_paths_and_history():
+    """拖拽路径解析 + 输出目录历史记忆 的单元测试。"""
+    fails = []
+    d = tempfile.mkdtemp(prefix='xlsx_deformula_drop_')
+    for name in ('a.xlsx', 'b.XLSM', 'c.txt', '~$lock.xlsx'):
+        open(os.path.join(d, name), 'w').write('x')
+    spaced = os.path.join(tempfile.mkdtemp(prefix='xlsx_deformula_sp_'), '空 格 文件.xlsx')
+    open(spaced, 'w').write('x')
+
+    # 多文件 + 带空格（Tk 用花括号包住）+ 非表格条目
+    found, ignored = tool.parse_dropped_paths('{%s} %s %s'
+                                              % (spaced, os.path.join(d, 'a.xlsx'),
+                                                 os.path.join(d, 'c.txt')))
+    names = [os.path.basename(x) for x in found]
+    if '空 格 文件.xlsx' not in names:
+        fails.append("带空格路径解析失败: %s" % names)
+    if 'a.xlsx' not in names:
+        fails.append("普通路径解析失败: %s" % names)
+    if not any('c.txt' == os.path.basename(x) for x in ignored):
+        fails.append("非 Excel 条目未被忽略")
+
+    # 拖入整个文件夹：只收表格，跳过 txt 与 ~$ 临时文件
+    found2, _ = tool.parse_dropped_paths(d)
+    names2 = sorted(os.path.basename(x) for x in found2)
+    if names2 != ['a.xlsx', 'b.XLSM']:
+        fails.append("文件夹解析结果不符: %s" % names2)
+
+    # 历史记忆：最近优先、去重、最多 10 条
+    cfg_home = tempfile.mkdtemp(prefix='xlsx_deformula_cfg_')
+    old_env = os.environ.get('XDG_CONFIG_HOME'), os.environ.get('APPDATA')
+    os.environ['XDG_CONFIG_HOME'] = cfg_home
+    os.environ['APPDATA'] = cfg_home
+    try:
+        for i in range(1, 13):
+            tool.remember_output_dir(os.path.join(cfg_home, 'out%d' % i))
+        tool.remember_output_dir(os.path.join(cfg_home, 'out5'))      # 重复项应提前
+        hist = tool.load_config()['output_history']
+        if len(hist) != 10:
+            fails.append("历史条数应为 10，实际 %d" % len(hist))
+        if not hist[0].endswith('out5'):
+            fails.append("最近使用的目录没有排在最前: %s" % hist[0])
+        if sum(1 for h in hist if h.endswith('out5')) != 1:
+            fails.append("历史没有去重")
+        if not os.path.exists(tool.config_file()):
+            fails.append("配置文件未落盘: %s" % tool.config_file())
+    finally:
+        for k, v in zip(('XDG_CONFIG_HOME', 'APPDATA'), old_env):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    for f in fails:
+        print("  ✘ " + f)
+    print("拖拽解析 / 历史记忆 测试：%s" % ("失败" if fails else "通过"))
+    return fails
 
 
 def verify_output(path):

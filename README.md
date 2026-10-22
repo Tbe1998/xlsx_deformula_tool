@@ -3,6 +3,12 @@
 把一份 Excel 工作簿里**所有工作表的公式**一次性转成数值，图表、图片、合并单元格、条件格式、
 行高列宽全部原样保留；**原始文件全程只读，不会被修改**。
 
+界面要点（v1.1）：
+- **拖拽导入**：把 `.xlsx / .xlsm` 文件直接拖进窗口即可，支持一次拖多个、也支持整文件夹拖入；
+  缺少拖拽组件时自动退回「添加文件…」按钮，不会崩。
+- **输出文件夹每次打开都要重新选择**（启动时不预填任何路径，没选会被拦下并提示）。
+- **历史输出文件夹**会被记住（最近优先、去重、最多 10 个），下拉即可直接选，不用逐层点目录。
+
 ---
 
 ## 一、目录内容
@@ -11,7 +17,7 @@
 |---|---|
 | `xlsx_deformula.py` | 主程序（图形界面 + 命令行两种用法，纯 Python 标准库，零第三方依赖） |
 | `一键打包exe.bat` | 在 Windows 上双击，自动装 PyInstaller 并生成单文件 exe |
-| `selftest.py` | 自检（造样例→转换→校验公式/数值/图片单元格/源文件不变），CI 与本地都能跑 |
+| `selftest.py` | 自检（造样例→转换→校验公式/数值/图片单元格/源文件不变，以及拖拽解析、历史记忆），CI 与本地都能跑 |
 | `make_ico.py` | 由 `icon.png` 生成纯 BMP 条目的 `icon.ico`（PIL 默认写 PNG 条目，PyInstaller 嵌入时易报错） |
 | `icon.ico` / `icon.png` | 程序图标 |
 | `.github/workflows/build-exe.yml` | 没有 Windows 电脑时，用 GitHub Actions 云端打包 exe |
@@ -53,12 +59,17 @@ python xlsx_deformula.py --cli "源文件.xlsx" "D:\输出\结果.xlsx"
 手动等价命令（想自己敲/T 换参数时）：
 
 ```bat
-python -m pip install pyinstaller
+python -m pip install pyinstaller tkinterdnd2
 pyinstaller --noconfirm --clean --onefile --windowed ^
   --name "Excel公式转数值" --icon icon.ico ^
+  --collect-all tkinterdnd2 ^
   --distpath dist --workpath build --specpath build ^
   xlsx_deformula.py
 ```
+
+> `--collect-all tkinterdnd2` 必须带上，否则 exe 里没有 tkdnd 组件，**拖拽功能失效**
+> （程序仍能运行，只能用按钮选文件）。打完可用 `Excel公式转数值.exe --check-dnd` 验证：
+> 退出码 0 = 拖拽可用，3 = 不可用。
 
 - `--onefile` 打成单个 exe（启动会先解压到临时目录，约 1–2 秒）；
 - 想启动更快、且不介意一个文件夹，把 `--onefile` 换成 `--onedir`；
@@ -78,13 +89,22 @@ pyinstaller --noconfirm --clean --onefile --windowed ^
 
 ## 四、界面用法
 
-1. **① 选择文件**：`添加文件…` 可多选 `.xlsx` / `.xlsm`；
-2. **② 输出位置**：三种方式任选
+1. **① 导入文件**（两种方式都行）
+   - **拖拽**：从资源管理器把 `.xlsx` / `.xlsm` 拖到窗口上方蓝色区域或文件列表里 ——
+     可一次拖多个，也可把**整个文件夹**拖进来（自动收集其中的表格，跳过 `~$` 临时文件和非 Excel 文件）；
+     拖入非表格文件会弹窗提示并忽略该条目。
+   - **按钮**：`添加文件…` 多选文件；`移除选中` / `清空列表` 调整列表。
+2. **② 输出位置**（三种方式任选）
    - 与原文件同目录，自动加 `_无公式`（默认）
-   - 输出到指定文件夹（自动保留原文件名 + 后缀）
+   - 输出到指定文件夹：**每次打开程序都要重新选择**；点 `浏览…` 选新目录，
+     或从**下拉历史记录**里直接挑一个（选过即记住，最近优先、最多 10 个）。
+     注意：下拉只是"候选"，需要你本次点选/选择后才会生效；没选就点开始会提示并中止。
    - 保存为指定文件（仅单个源文件时可用）
-3. 点 **开始转换**，下方日志会逐文件显示：工作表数、公式单元格数、结果路径。
+3. 点 **开始转换**，下方日志逐文件显示：工作表数、公式单元格数、内嵌图片单元格数、结果路径。
 4. `打开输出文件夹` 直接定位结果。
+
+配置文件：`%APPDATA%\XlsxDeformula\config.json`（非 Windows 为 `~/.config/XlsxDeformula/config.json`），
+只保存历史输出目录，不含任何路径以外的信息。
 
 安全约束：程序拒绝把结果写到源文件路径上；源文件只以只读方式打开。
 
@@ -194,3 +214,23 @@ pyinstaller --noconfirm --clean --onefile --windowed ^
 校验产物（公式已转数值 / 图片单元格保留 / 源文件未改动）。任一步失败会自动**临时再构建一个
 `--console` 版本**跑同一命令，把 stdout/stderr 写进任务摘要 —— 因为 windowed 程序本身没有控制台输出，
 不这么做失败原因是不可见的。诊断版不进产物、只用于定位。
+
+
+---
+
+## 十、拖拽功能的实现与排查
+
+- 拖拽依赖 **tkinterdnd2**（Tcl 扩展 tkdnd 的 Python 包装），tkinter 本身不支持文件拖放。
+  打包时必须 `--collect-all tkinterdnd2`，把各平台 tkdnd 二进制一起塞进 exe。
+- 程序有三层兜底，任何一层失败都不会崩：
+  1. `import tkinterdnd2` 失败 → 直接用普通 `tk.Tk()`，界面照常，只能按钮选文件；
+  2. 拖拽注册失败（`drop_target_register` 抛异常）→ 忽略，按钮照常；
+  3. 想彻底关掉拖拽排障：设环境变量 `XLSX_DEFORMULA_NO_DND=1` 再启动。
+- 自检命令（windowed exe 也能返回退出码）：
+  ```bat
+  Excel公式转数值.exe --check-dnd
+  ```
+- CI 里已加「校验拖拽组件已打进 exe」这一步，退出码不是 0 直接判失败，
+  避免发布一个"看起来正常、其实拖不进去"的包。
+- 已知限制：拖拽文件在**提权运行的资源管理器**（管理员窗口）里拖进普通权限程序会被 Windows 拦，
+  这是系统 UIPI 限制；以相同权限运行即可。

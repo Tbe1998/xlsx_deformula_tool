@@ -5,8 +5,11 @@ Excel 公式转数值工具 (Excel Formula to Value)
 
 功能
 ----
-1) 图形界面选择要处理的 Excel 文件（可多选，支持 .xlsx / .xlsm）
+1) 图形界面导入要处理的 Excel 文件：支持**拖拽**（可一次拖多个文件，也可整文件夹拖入），
+   也保留「添加文件…」按钮（.xlsx / .xlsm）
 2) 指定输出位置（源文件同目录自动命名 / 指定目录 / 指定单个文件名）
+   · 输出文件夹**每次打开程序都要重新选择**，启动时不预填任何路径
+   · 选过的输出文件夹会被记住（最多 10 个，最近优先），下次可从下拉历史直接选
 3) 原始文件全程只读，绝不修改（只读取源文件，结果写入新文件）
 4) 保留图表、图片、合并单元格、条件格式、行高列宽——只在 XML 层剥离 <f> 公式，
    保留公式的缓存计算结果 <v>，不用 openpyxl 重新保存（会丢图表）
@@ -29,7 +32,7 @@ import traceback
 from xml.sax.saxutils import escape
 
 APP_NAME = "Excel 公式转数值工具"
-APP_VER = "1.0"
+APP_VER = "1.1"
 SUFFIX = "_无公式"
 
 # ---------------------------------------------------------------- 核心引擎
@@ -228,16 +231,153 @@ def default_out(src, outdir):
     return cand
 
 
+# ---------------------------------------------------------------- 配置 / 记忆
+#
+# 需求约定：
+#   · 输出文件夹「每次打开程序都要重新选择」——启动时不预填任何路径，
+#     指向"指定文件夹"的模式下若没选，转换会被拦下并提示；
+#   · 历史输出文件夹会被记住（最多 10 条，最近优先、去重），
+#     下拉即可直接选用，省去逐层点目录。
+
+EXCEL_EXTS = ('.xlsx', '.xlsm')
+HISTORY_MAX = 10
+
+
+def config_file():
+    """配置文件路径：Windows 用 %APPDATA%，其他平台用 ~/.config。"""
+    if sys.platform.startswith('win'):
+        base = os.environ.get('APPDATA') or os.path.expanduser('~')
+    else:
+        base = os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config')
+    folder = os.path.join(base, 'XlsxDeformula')
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except Exception:
+        folder = os.path.expanduser('~')
+    return os.path.join(folder, 'config.json')
+
+
+def load_config():
+    import json
+    path = config_file()
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {'output_history': []}
+        hist = [h for h in data.get('output_history', []) if isinstance(h, str) and h]
+        data['output_history'] = hist
+        return data
+    except Exception:
+        return {'output_history': []}
+
+
+def save_config(cfg):
+    import json
+    try:
+        with open(config_file(), 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def remember_output_dir(folder):
+    """把文件夹记进历史（最近的排最前，最多 10 条，忽略大小写去重）。"""
+    if not folder:
+        return load_config()
+    folder = os.path.abspath(folder)
+    cfg = load_config()
+    hist = [h for h in cfg.get('output_history', [])
+            if os.path.normcase(os.path.abspath(h)) != os.path.normcase(folder)]
+    hist.insert(0, folder)
+    cfg['output_history'] = hist[:HISTORY_MAX]
+    save_config(cfg)
+    return cfg
+
+
+def is_excel_file(path):
+    name = os.path.basename(path)
+    return (name.lower().endswith(EXCEL_EXTS)
+            and not name.startswith('~$')          # Excel 临时文件
+            and not name.startswith('.'))
+
+
+def parse_dropped_paths(data, splitlist=None):
+    """解析拖拽事件里的路径串。
+
+    支持：单个文件、多个文件（含带空格的路径，Tk 会加花括号）、整个文件夹（收集其中的表格）。
+    返回 (可处理的文件列表, 被忽略的条目列表)。
+    """
+    if splitlist is not None:
+        try:
+            parts = list(splitlist(data))
+        except Exception:
+            parts = [data]
+    elif isinstance(data, str):
+        # 没有 Tk splitlist 时的兜底：按花括号或空白切分，保留带空格的路径
+        parts = re.findall(r'\{[^}]*\}|[^\s]+', data)
+    else:
+        parts = list(data)
+
+    found, ignored = [], []
+    for raw in parts:
+        p = str(raw).strip()
+        if len(p) >= 2 and p[0] == '{' and p[-1] == '}':
+            p = p[1:-1]
+        if len(p) >= 2 and p[0] == '"' and p[-1] == '"':
+            p = p[1:-1]
+        if not p:
+            continue
+        if os.path.isdir(p):
+            hit = 0
+            try:
+                for name in sorted(os.listdir(p)):
+                    full = os.path.join(p, name)
+                    if os.path.isfile(full) and is_excel_file(full):
+                        found.append(full)
+                        hit += 1
+            except Exception:
+                pass
+            if not hit:
+                ignored.append(p)
+        elif os.path.isfile(p) and is_excel_file(p):
+            found.append(p)
+        else:
+            ignored.append(p)
+    return found, ignored
+
+
 # ---------------------------------------------------------------- 图形界面
 
 def run_gui():
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
 
-    root = tk.Tk()
+    # 拖拽组件（tkdnd 的 Python 包装）；缺失或异常时不崩，退回按钮选文件。
+    # 设置环境变量 XLSX_DEFORMULA_NO_DND=1 可强制关闭拖拽（排障用）。
+    HAS_DND = False
+    DND_FILES = None
+    root = None
+    if not os.environ.get('XLSX_DEFORMULA_NO_DND'):
+        try:
+            from tkinterdnd2 import TkinterDnD, DND_FILES as _DND_FILES
+            root = TkinterDnD.Tk()
+            DND_FILES = _DND_FILES
+            HAS_DND = True
+        except Exception as e:
+            sys.stderr.write("拖拽组件不可用，改用按钮选文件：%s\n" % e)
+            try:
+                root.destroy()
+            except Exception:
+                pass
+            root = None
+    if root is None:
+        root = tk.Tk()
+
     root.title("%s v%s" % (APP_NAME, APP_VER))
-    root.geometry("760x560")
-    root.minsize(680, 500)
+    root.geometry("820x660")
+    root.minsize(720, 580)
 
     # 选一个带中文的界面字体（Windows 用微软雅黑，其余平台依次回退）
     try:
@@ -257,23 +397,50 @@ def run_gui():
     except Exception:
         pass
 
+    cfg = load_config()
     files = []
     mode = tk.StringVar(value='same')
-    outdir = tk.StringVar(value='')
+    outdir = tk.StringVar(value='')          # 每次启动都从空开始：必须重新选择
     outfile = tk.StringVar(value='')
     keep_links = tk.BooleanVar(value=True)
     running = {'v': False}
-
     pad = {'padx': 8, 'pady': 4}
 
-    # 文件列表
+    # ---------- ① 文件（支持拖拽） ----------
     f1 = ttk.LabelFrame(root, text="① 要处理的 Excel 文件（原始文件只读，不会被修改）")
     f1.pack(fill='both', expand=False, **pad)
-    lst = tk.Listbox(f1, height=6, selectmode='extended')
-    lst.pack(side='left', fill='both', expand=True, padx=6, pady=6)
-    sb = ttk.Scrollbar(f1, orient='vertical', command=lst.yview)
-    sb.pack(side='left', fill='y', pady=6)
+
+    if HAS_DND:
+        drop_hint = "把 Excel 文件（或整个文件夹）拖到这里 —— 支持一次拖多个\n也可以点这里 / 下方「添加文件…」按钮选择"
+    else:
+        drop_hint = "当前运行环境缺少拖拽组件（tkdnd），请点这里或「添加文件…」按钮选择文件"
+    drop_zone = tk.Label(f1, text=drop_hint, height=3, relief='groove', bd=2,
+                         bg='#eef4ff', fg='#20406b', justify='center', cursor='hand2')
+    drop_zone.pack(fill='x', padx=8, pady=(8, 4))
+
+    body = ttk.Frame(f1)
+    body.pack(fill='both', expand=True, padx=8, pady=(0, 8))
+    lst = tk.Listbox(body, height=7, selectmode='extended')
+    lst.pack(side='left', fill='both', expand=True)
+    sb = ttk.Scrollbar(body, orient='vertical', command=lst.yview)
+    sb.pack(side='left', fill='y')
     lst.configure(yscrollcommand=sb.set)
+
+    btns = ttk.Frame(body)
+    btns.pack(side='right', fill='y', padx=(8, 0))
+    cnt = tk.StringVar(value="已选 0 个文件")
+
+    log_holder = {}
+
+    def logln(s):
+        box = log_holder.get('box')
+        if box is None:
+            return
+        box.configure(state='normal')
+        box.insert('end', s + "\n")
+        box.see('end')
+        box.configure(state='disabled')
+        root.update_idletasks()
 
     def refresh():
         lst.delete(0, 'end')
@@ -281,14 +448,29 @@ def run_gui():
             lst.insert('end', f)
         cnt.set("已选 %d 个文件" % len(files))
 
+    def add_paths(paths, rejected=()):
+        added = 0
+        for p in paths:
+            p = os.path.abspath(p)
+            if p not in files:
+                files.append(p)
+                added += 1
+        refresh()
+        if added:
+            logln("已加入 %d 个文件。" % added)
+        if rejected:
+            shown = "、".join(os.path.basename(r) for r in rejected[:5])
+            more = "" if len(rejected) <= 5 else " 等 %d 项" % len(rejected)
+            logln("已忽略非 Excel 条目：%s%s" % (shown, more))
+            messagebox.showwarning(APP_NAME, "以下条目不是 .xlsx / .xlsm 表格，已忽略：\n\n%s%s"
+                                   % (shown, more))
+
     def add_files():
         paths = filedialog.askopenfilenames(
             title="选择 Excel 文件",
             filetypes=[("Excel 工作簿", "*.xlsx *.xlsm"), ("所有文件", "*.*")])
-        for p in paths:
-            if p not in files:
-                files.append(p)
-        refresh()
+        if paths:
+            add_paths(paths)
 
     def del_sel():
         for i in reversed(lst.curselection()):
@@ -299,75 +481,103 @@ def run_gui():
         files.clear()
         refresh()
 
-    btns = ttk.Frame(f1)
-    btns.pack(side='right', fill='y', padx=6, pady=6)
+    def on_drop(event):
+        found, ignored = parse_dropped_paths(event.data, root.tk.splitlist)
+        if found or ignored:
+            add_paths(found, ignored)
+
     ttk.Button(btns, text="添加文件…", command=add_files).pack(fill='x', pady=2)
     ttk.Button(btns, text="移除选中", command=del_sel).pack(fill='x', pady=2)
     ttk.Button(btns, text="清空列表", command=clear_all).pack(fill='x', pady=2)
-    cnt = tk.StringVar(value="已选 0 个文件")
-    ttk.Label(btns, textvariable=cnt).pack(fill='x', pady=(6, 0))
+    ttk.Label(btns, textvariable=cnt).pack(fill='x', pady=(8, 0))
 
-    # 输出设置
+    if HAS_DND:
+        for widget in (root, drop_zone, lst):
+            try:
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind('<<Drop>>', on_drop)
+            except Exception:
+                pass
+    drop_zone.bind('<Button-1>', lambda e: add_files())
+
+    # ---------- ② 输出位置 ----------
     f2 = ttk.LabelFrame(root, text="② 输出位置")
     f2.pack(fill='x', **pad)
     ttk.Radiobutton(f2, text="与原文件同目录（文件名自动加 “%s”）" % SUFFIX,
-                    variable=mode, value='same').grid(row=0, column=0, sticky='w', padx=8, pady=3, columnspan=3)
+                    variable=mode, value='same').grid(row=0, column=0, sticky='w',
+                                                      padx=8, pady=3, columnspan=4)
     ttk.Radiobutton(f2, text="输出到指定文件夹：", variable=mode, value='dir'
                     ).grid(row=1, column=0, sticky='w', padx=8, pady=3)
-    e_dir = ttk.Entry(f2, textvariable=outdir, width=52)
-    e_dir.grid(row=1, column=1, sticky='we', pady=3)
+
+    hist = list(cfg.get('output_history', []))
+    cb_dir = ttk.Combobox(f2, textvariable=outdir, values=hist, width=52)
+    cb_dir.grid(row=1, column=1, sticky='we', pady=3)
+
+    def on_hist(_evt=None):
+        if outdir.get().strip():
+            mode.set('dir')
+
+    cb_dir.bind('<<ComboboxSelected>>', on_hist)
 
     def pick_dir():
-        d = filedialog.askdirectory(title="选择输出文件夹")
+        start = outdir.get().strip() or (hist[0] if hist else '')
+        if not os.path.isdir(start):
+            start = os.path.expanduser('~')
+        d = filedialog.askdirectory(title="选择输出文件夹", initialdir=start)
         if d:
             outdir.set(d)
             mode.set('dir')
+
     ttk.Button(f2, text="浏览…", command=pick_dir).grid(row=1, column=2, padx=6)
 
     ttk.Radiobutton(f2, text="保存为指定文件（仅单个源文件时）：", variable=mode, value='file'
                     ).grid(row=2, column=0, sticky='w', padx=8, pady=3)
-    e_file = ttk.Entry(f2, textvariable=outfile, width=52)
-    e_file.grid(row=2, column=1, sticky='we', pady=3)
+    ttk.Entry(f2, textvariable=outfile, width=52).grid(row=2, column=1, sticky='we', pady=3)
 
     def pick_file():
         p = filedialog.asksaveasfilename(title="另存为", defaultextension=".xlsx",
-                                        filetypes=[("Excel 工作簿", "*.xlsx")])
+                                         filetypes=[("Excel 工作簿", "*.xlsx")])
         if p:
             outfile.set(p)
             mode.set('file')
     ttk.Button(f2, text="浏览…", command=pick_file).grid(row=2, column=2, padx=6)
     f2.columnconfigure(1, weight=1)
 
+    hist_state = tk.StringVar(
+        value=("历史输出文件夹：%d 个，可下拉直接选" % len(hist)) if hist
+        else "历史输出文件夹：暂无（选过一次后自动记住，最多 10 个）")
+    ttk.Label(f2, textvariable=hist_state, foreground='#55607a').grid(
+        row=3, column=1, sticky='w', pady=(0, 4))
+    ttk.Label(f2, text="提示：每次打开程序都需要重新选择输出文件夹（历史目录可下拉快选）。",
+              foreground='#8a5a00').grid(row=4, column=0, sticky='w', padx=8, pady=(0, 6),
+                                         columnspan=4)
+
     opt = ttk.Frame(root)
     opt.pack(fill='x', padx=8)
     ttk.Checkbutton(opt, text="保留对外部工作簿的引用（一般保留即可）",
                     variable=keep_links).pack(side='left')
 
-    # 运行区
+    # ---------- 运行区 ----------
     f3 = ttk.Frame(root)
     f3.pack(fill='both', expand=True, **pad)
     bar = ttk.Progressbar(f3, mode='determinate', maximum=100)
     bar.pack(fill='x', pady=(2, 4))
-    log = tk.Text(f3, height=12, wrap='word', state='disabled')
-    log.pack(fill='both', expand=True)
-    lgsb = ttk.Scrollbar(f3, orient='vertical', command=log.yview)
-    lgsb.place(relx=1.0, rely=0, relheight=1, anchor='ne')
-    log.configure(yscrollcommand=lgsb.set)
-
-    def logln(s):
-        log.configure(state='normal')
-        log.insert('end', s + "\n")
-        log.see('end')
-        log.configure(state='disabled')
-        root.update_idletasks()
+    log_box = tk.Text(f3, height=11, wrap='word', state='disabled')
+    log_box.pack(fill='both', expand=True, side='left')
+    lgsb = ttk.Scrollbar(f3, orient='vertical', command=log_box.yview)
+    lgsb.pack(side='right', fill='y')
+    log_box.configure(yscrollcommand=lgsb.set)
+    log_holder['box'] = log_box
 
     def set_prog(frac):
         bar['value'] = max(0, min(1, frac)) * 100
 
+    def history_values():
+        return list(load_config().get('output_history', []))
+
     def plan_outputs():
-        """返回 [(src, dst)]，并做合法性检查。"""
         if not files:
-            raise ValueError("请先添加要处理的 Excel 文件")
+            raise ValueError("请先添加或拖入要处理的 Excel 文件")
         m = mode.get()
         if m == 'file':
             if len(files) > 1:
@@ -380,8 +590,17 @@ def run_gui():
         if m == 'dir':
             d = outdir.get().strip()
             if not d:
-                raise ValueError("请填写或选择输出文件夹")
-            os.makedirs(d, exist_ok=True)
+                raise ValueError("本次启动还没有选择输出文件夹。\n"
+                                 "请点「浏览…」选一个，或从下拉的历史记录里直接挑一个。")
+            if not os.path.isdir(d):
+                try:
+                    os.makedirs(d, exist_ok=True)
+                except Exception as e:
+                    raise ValueError("输出文件夹不可用：%s\n%s" % (d, e))
+            remember_output_dir(d)
+            vals = history_values()
+            cb_dir.configure(values=vals)
+            hist_state.set("历史输出文件夹：%d 个，可下拉直接选" % len(vals))
         else:
             d = None
         return [(f, default_out(f, d)) for f in files]
@@ -461,11 +680,13 @@ def run_gui():
     ttk.Button(bar2, text="退出", command=root.destroy).pack(side='right')
 
     logln("%s v%s 就绪。原始文件全程只读，结果另存为新文件。" % (APP_NAME, APP_VER))
-    logln("提示：本工具只搬运公式已有的计算结果，不负责计算。若图表需要保留，请勿用 Excel 另存再处理。")
+    if HAS_DND:
+        logln("支持拖拽：把 .xlsx / .xlsm 文件（或整个文件夹）直接拖进窗口即可加入列表。")
+    else:
+        logln("提示：当前环境缺少拖拽组件（tkdnd），请用「添加文件…」按钮选择文件。")
+    logln("输出文件夹每次打开都要重新选择；选过的目录会进入历史记录，可从下拉列表直接挑。")
     root.mainloop()
     return 0
-
-
 def main():
     # PyInstaller --windowed 冻结环境下 stdout/stderr 可能是 None，
     # 此时 print/write 会抛异常，统一重定向到 devnull。
@@ -478,6 +699,15 @@ def main():
     args = [a for a in sys.argv[1:]]
     if args and args[0] in ('--cli', 'cli'):
         return run_cli(args[1:])
+    if args and args[0] == '--check-dnd':
+        # 退出码 0 = 拖拽组件可用；3 = 不可用（GUI 仍可运行，但只能用按钮选文件）
+        try:
+            import tkinterdnd2  # noqa: F401
+            print("tkinterdnd2 OK")
+            return 0
+        except Exception as e:
+            sys.stderr.write("tkinterdnd2 不可用：%s\n" % e)
+            return 3
     if args and args[0] in ('--help', '-h'):
         print(__doc__)
         return 0

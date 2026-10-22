@@ -48,9 +48,10 @@ if not exist ".buildenv\Scripts\python.exe" (
 call ".buildenv\Scripts\activate.bat"
 python -m pip install -q -U pip >nul 2>&1
 
-echo [3/5] 安装 PyInstaller ...
-python -m pip install -q pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple || python -m pip install -q pyinstaller
+echo [3/5] 安装 PyInstaller 与拖拽组件 tkinterdnd2 ...
+python -m pip install -q pyinstaller tkinterdnd2 -i https://pypi.tuna.tsinghua.edu.cn/simple || python -m pip install -q pyinstaller tkinterdnd2
 python -c "import PyInstaller" >nul 2>&1 || (echo [失败] PyInstaller 安装失败，请检查网络后重试 & pause & exit /b 1)
+python -c "import tkinterdnd2" >nul 2>&1 || echo [提示] tkinterdnd2 未装上，exe 将不支持拖拽（仍可用按钮选文件）
 
 rem ---------- 3. 引擎自检（不通过就不打包） ----------
 echo [4/5] 引擎自检 ...
@@ -68,7 +69,7 @@ rmdir /s /q build 2>nul
 
 set "ICON=--icon icon.ico"
 if not exist "icon.ico" set "ICON="
-pyinstaller --noconfirm --clean --onefile --windowed --name XlsxFormulaToValue !ICON! --distpath dist --workpath build --specpath build xlsx_deformula.py
+pyinstaller --noconfirm --clean --onefile --windowed --name XlsxFormulaToValue --collect-all tkinterdnd2 !ICON! --distpath dist --workpath build --specpath build xlsx_deformula.py
 
 if exist "dist\XlsxFormulaToValue.exe" goto built
 if not defined ICON goto failed
@@ -76,11 +77,13 @@ if not defined ICON goto failed
 echo [提示] 带图标打包失败，去掉图标重试 ...
 rmdir /s /q dist 2>nul
 rmdir /s /q build 2>nul
-pyinstaller --noconfirm --clean --onefile --windowed --name XlsxFormulaToValue --distpath dist --workpath build --specpath build xlsx_deformula.py
+pyinstaller --noconfirm --clean --onefile --windowed --name XlsxFormulaToValue --collect-all tkinterdnd2 --distpath dist --workpath build --specpath build xlsx_deformula.py
 if not exist "dist\XlsxFormulaToValue.exe" goto failed
 
 :built
 copy /y "dist\XlsxFormulaToValue.exe" "dist\Excel公式转数值.exe" >nul
+start /wait "" "dist\Excel公式转数值.exe" --check-dnd
+if errorlevel 3 echo [提示] 这个 exe 里没有打进拖拽组件，只能用「添加文件…」按钮选文件。
 echo.
 echo ============================================================
 echo  打包完成！

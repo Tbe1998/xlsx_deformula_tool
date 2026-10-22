@@ -23,6 +23,8 @@ name: build-windows-exe
 # ④ Defender 锁 exe（[WinError 5]）→ 构建前加排除项；
 # ⑤ 只保留单文件配置，逐套记录退出码，成功条件三合一（退出码0 + 产物是文件 + 无同名目录）；
 # ⑥ 冒烟测试 & 同步误判 → 改 Start-Process -Wait -PassThru 并轮询输出文件；
+# ⑧ 拖拽导入：界面依赖 tkinterdnd2(tkdnd) → 打包时 --collect-all tkinterdnd2，
+#    并新增「--check-dnd」自检步骤，确认组件真的进了 exe（否则拖拽不可用）；
 # ⑦ Node.js 20 弃用 → 全部动作升级到 Node 24 版本（checkout@v7 / setup-python@v7 / upload-artifact@v7）。
 
 on:
@@ -68,18 +70,23 @@ jobs:
           Add-Content -Path $summary -Value ""
           Get-ChildItem -Name
 
-      - name: 安装 PyInstaller
+      - name: 安装 PyInstaller 与拖拽组件
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
           # 优先使用已验证版本，失败再退回最新版
-          python -m pip install "pyinstaller==6.22.3"
+          python -m pip install "pyinstaller==6.22.3" tkinterdnd2
           if ($LASTEXITCODE -ne 0) {
             Write-Host "固定版本安装失败，退回最新版"
-            python -m pip install pyinstaller
+            python -m pip install pyinstaller tkinterdnd2
           }
           pyinstaller --version
           python -c "import PyInstaller, sys; print('PyInstaller', PyInstaller.__version__, '| Python', sys.version.split()[0])"
+          python -c "import tkinterdnd2, os; print('tkinterdnd2 OK ->', os.path.dirname(tkinterdnd2.__file__))"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "::error title=缺少拖拽组件::tkinterdnd2 安装失败，打出来的 exe 将不支持拖拽"
+            exit 1
+          }
 
       - name: 关闭 Defender 对工作目录的实时扫描
         shell: pwsh
@@ -112,11 +119,12 @@ jobs:
           $summary = $env:GITHUB_STEP_SUMMARY
 
           # 全部是 --onefile 配置，绝不使用 --onedir
+          # 全部带上 --collect-all tkinterdnd2，确保拖拽组件（tkdnd）打进 exe
           $attempts = @(
-            @{ id = 'onefile';         extra = @() },
-            @{ id = 'onefile-retry';   extra = @() },
-            @{ id = 'onefile-icon';    extra = @('--icon','icon.ico') },
-            @{ id = 'onefile-noupx';   extra = @('--noupx') }
+            @{ id = 'onefile';         extra = @('--collect-all','tkinterdnd2') },
+            @{ id = 'onefile-retry';   extra = @('--collect-all','tkinterdnd2') },
+            @{ id = 'onefile-icon';    extra = @('--collect-all','tkinterdnd2','--icon','icon.ico') },
+            @{ id = 'onefile-noupx';   extra = @('--collect-all','tkinterdnd2','--noupx') }
           )
 
           Add-Content -Path $summary -Value ""
@@ -205,6 +213,23 @@ jobs:
           }
           $extra = Get-ChildItem dist -File | Where-Object { $_.Name -ne 'Excel公式转数值.exe' }
           if ($extra) { Write-Host ("dist 下其他文件（不上传）：" + (($extra | ForEach-Object Name) -join ', ')) }
+
+      - name: 校验拖拽组件已打进 exe
+        shell: pwsh
+        run: |
+          $summary = $env:GITHUB_STEP_SUMMARY
+          $exe = (Resolve-Path "dist/Excel公式转数值.exe" -ErrorAction Stop).Path
+          $p = Start-Process -FilePath $exe -ArgumentList @('--check-dnd') -Wait -PassThru
+          $code = $p.ExitCode
+          Write-Host "拖拽组件自检退出码: $code（0=可用，3=不可用）"
+          if ($code -eq 0) {
+            Add-Content -Path $summary -Value "- 拖拽组件：✅ 已打包进 exe（tkdnd 可用）"
+            Write-Host "::notice title=拖拽组件可用::exe 内 tkdnd 正常"
+          } else {
+            Add-Content -Path $summary -Value "- 拖拽组件：❌ 未打进 exe（退出码 $code），拖拽不可用"
+            Write-Output "::error title=拖拽组件缺失::exe 里没有 tkdnd，拖拽功能不可用（请检查 --collect-all tkinterdnd2）"
+            exit 1
+          }
 
       # --windowed 产物是 GUI 子系统程序：直接 & 调用不会等待，必须 Start-Process -Wait
       - name: 冒烟测试（单文件产物实跑一次）
