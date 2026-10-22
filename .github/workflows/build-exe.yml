@@ -1,15 +1,22 @@
 name: build-windows-exe
 
-# 没有 Windows 电脑时，用 GitHub 免费 Windows 运行器打包：
-# 仓库 → Actions → build-windows-exe → Run workflow
-# 完成后在该次运行的 Artifacts 里下载 Excel公式转数值-windows.zip
+# Windows 云端打包。仓库 → Actions → build-windows-exe → Run workflow
+# 产物：Artifacts 里的 Excel公式转数值-windows.zip
 #
-# 2026-10 修复记录（上一次运行第 6 步"打包单文件 exe"失败、第 17 步 Node.js 20 弃用警告）：
-#   1. 强制 UTF-8：Windows 运行器 stdout 是管道，默认 cp1252，PyInstaller 打印中文路径即崩溃；
-#   2. 续行符改数组：不再用 PowerShell 反引号续行，避免参数被截断导致 pyinstaller 收不到脚本名；
-#   3. 内部包名改 ASCII（XlsxFormulaToValue），中文名打包后重命名，彻底绕开编码问题；
-#   4. 图标改用纯 BMP 条目的 ico，且带图标失败时自动回退无图标重试；
-#   5. actions 全部升级到 Node 24 版本：checkout@v5 / setup-python@v6 / upload-artifact@v5。
+# 修复记录
+# ---------
+# 第 1 次失败（第 6 步 PyInstaller 退出码 1）：
+#   1. Windows 运行器 stdout 走管道时默认 cp1252，PyInstaller 打印中文路径即 UnicodeEncodeError
+#      → 全流程强制 PYTHONUTF8/PYTHONIOENCODING，内部包名用 ASCII，打包后再改中文名；
+#   2. PowerShell 反引号续行会截断参数 → 改数组一次调用；
+#   3. 图标 ico 条目原为 PNG 压缩 → 改用纯 BMP 条目（make_ico.py），并保留无图标回退。
+# 第 2 次失败（第 8 步 PyInstaller 退出码 1，自检已通过，日志靠后的 EXE 拼装阶段）：
+#   4. Defender 实时防护会锁住正在写入的 exe（[WinError 5] Access is denied），
+#      报错发生在 "Building EXE from EXE-00.toc" 阶段 → 先把工作目录加入 Defender 排除项；
+#   5. 打包改为「多套配置依次尝试」：标准 onefile → 带图标 onefile → onedir 目录模式，
+#      哪套成功用哪套（onedir 不往 exe 尾部追加数据，最不容易被防护干扰）；
+#   6. 每次尝试的完整日志写入 $GITHUB_STEP_SUMMARY（失败也能在运行页面直接看到），
+#      并作为 artifact 留存。
 
 on:
   workflow_dispatch:
@@ -20,6 +27,7 @@ env:
   PYTHONUTF8: '1'
   PYTHONIOENCODING: 'utf-8'
   PYTHONLEGACYWINDOWSSTDIO: '0'
+  PYINSTALLER_NAME: XlsxFormulaToValue
 
 jobs:
   build:
@@ -35,13 +43,32 @@ jobs:
         run: |
           python -V
           python -c "import sys; print('stdout encoding =', sys.stdout.encoding); print('fs encoding =', sys.getfilesystemencoding())"
+          Get-PSDrive C | Select-Object Used, Free | Format-List
           Get-ChildItem -Name
 
       - name: 安装 PyInstaller
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller
+          # 优先用已验证通过的版本，失败再退回最新版
+          python -m pip install "pyinstaller==6.22.3"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "固定版本安装失败，退回最新版"
+            python -m pip install pyinstaller
+          }
           pyinstaller --version
+          python -c "import PyInstaller, sys; print('PyInstaller', PyInstaller.__version__, 'on Python', sys.version)" 
+
+      - name: 关闭 Defender 对工作目录的实时扫描
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          try {
+            Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE -ErrorAction Stop
+            Write-Host "已把 $env:GITHUB_WORKSPACE 加入 Defender 排除项"
+          } catch {
+            Write-Host "无法修改 Defender 设置（不影响继续构建）: $($_.Exception.Message)"
+          }
 
       - name: 校验脚本语法与 tkinter
         run: |
@@ -51,62 +78,103 @@ jobs:
       - name: 引擎自检（公式转数值/图片保留/源文件不变）
         run: python selftest.py
 
-      # 单行命令 + ASCII 内部名；带图标失败自动无图标重试
-      - name: 打包单文件 exe
+      # 依次尝试多套打包配置，任一成功即通过；每套日志都留存
+      - name: 打包 exe（多套配置依次尝试）
+        id: build
         shell: pwsh
         run: |
-          $common = @('--noconfirm','--clean','--onefile','--windowed',
-                      '--name','XlsxFormulaToValue',
-                      '--distpath','dist','--workpath','build','--specpath','build',
-                      'xlsx_deformula.py')
-          if (Test-Path "icon.ico") {
-            Write-Host ">>> 第 1 次尝试：带图标打包"
-            pyinstaller @common --icon icon.ico
-          }
-          if (-not (Test-Path "dist/XlsxFormulaToValue.exe")) {
-            Write-Host ">>> 第 2 次尝试：去掉图标重新打包（规避图标格式问题）"
+          $ErrorActionPreference = 'Continue'
+          $name = $env:PYINSTALLER_NAME
+          $summary = $env:GITHUB_STEP_SUMMARY
+          $attempts = @(
+            @{ id = 'onefile';       params = @('--onefile','--windowed') },
+            @{ id = 'onefile-retry'; params = @('--onefile','--windowed') },
+            @{ id = 'onefile-icon';  params = @('--onefile','--windowed','--icon','icon.ico') },
+            @{ id = 'onedir';        params = @('--onedir','--windowed') }
+          )
+
+          Add-Content -Path $summary -Value "## 打包尝试记录"
+          Add-Content -Path $summary -Value ""
+          $ok = $false
+          foreach ($a in $attempts) {
             Remove-Item -Recurse -Force dist,build -ErrorAction SilentlyContinue
-            pyinstaller @common
+            Start-Sleep -Seconds 2
+            $log = "build_$($a.id).log"
+            $argv = @('--noconfirm','--clean','--name',$name) + $a.params + @('xlsx_deformula.py')
+            Write-Host ">>> 尝试 [$($a.id)]: pyinstaller $($argv -join ' ')"
+            & pyinstaller @argv 2>&1 | Tee-Object -FilePath $log
+            $code = $LASTEXITCODE
+            $hasExe = Test-Path "dist/$name.exe"
+            $hasDir = Test-Path "dist/$name/$name.exe"
+            Write-Host "    退出码=$code  onefile产物=$hasExe  onedir产物=$hasDir"
+            Add-Content -Path $summary -Value "### 尝试 [$($a.id)] 退出码 $code / onefile=$hasExe / onedir=$hasDir"
+            if ($code -eq 0 -and ($hasExe -or $hasDir)) {
+              $ok = $true
+              "mode=$($a.id)" | Out-File -FilePath build_mode.txt -Encoding utf8
+              break
+            }
+            Add-Content -Path $summary -Value "~~~"
+            Add-Content -Path $summary -Value (Get-Content $log -Tail 80 | Out-String)
+            Add-Content -Path $summary -Value "~~~"
           }
-          if (-not (Test-Path "dist/XlsxFormulaToValue.exe")) {
-            Write-Error "打包失败：dist 下没有生成 exe"
+
+          if (-not $ok) {
+            Write-Error "全部打包配置均失败，详见本步骤日志与运行页面的 Summary"
             exit 1
           }
           Get-ChildItem dist | Select-Object Name, Length | Format-Table -AutoSize
 
-      - name: 重命名为中文并检查体积
+      - name: 生成中文名产物并检查体积
         shell: pwsh
         run: |
-          Copy-Item "dist/XlsxFormulaToValue.exe" "dist/Excel公式转数值.exe" -Force
-          $len = (Get-Item "dist/XlsxFormulaToValue.exe").Length
-          Write-Host ("exe 大小: {0:N1} MB" -f ($len / 1MB))
-          if ($len -lt 5MB) {
-            Write-Error "exe 体积异常（小于 5MB），可能缺少运行库"
+          $name = $env:PYINSTALLER_NAME
+          if (Test-Path "dist/$name.exe") {
+            Copy-Item "dist/$name.exe" "dist/Excel公式转数值.exe" -Force
+            $len = (Get-Item "dist/Excel公式转数值.exe").Length
+            Write-Host ("单文件 exe 大小: {0:N1} MB" -f ($len / 1MB))
+            if ($len -lt 5MB) { Write-Error "exe 体积异常"; exit 1 }
+            "kind=onefile" | Out-File -FilePath artifact_kind.txt -Encoding utf8
+          } elseif (Test-Path "dist/$name/$name.exe") {
+            Copy-Item "dist/$name" "dist/Excel公式转数值" -Recurse -Force
+            Copy-Item "dist/$name/$name.exe" "dist/Excel公式转数值/Excel公式转数值.exe" -Force
+            $len = (Get-Item "dist/Excel公式转数值/Excel公式转数值.exe").Length
+            Write-Host ("目录模式主程序大小: {0:N1} MB" -f ($len / 1MB))
+            "kind=onedir" | Out-File -FilePath artifact_kind.txt -Encoding utf8
+          } else {
+            Write-Error "找不到打包产物"
             exit 1
           }
 
-      # 真机冒烟测试：用打包好的 exe 跑一遍命令行业务流程，再校验产物
-      - name: 冒烟测试（exe 实跑一次）
+      - name: 冒烟测试（打包产物实跑一次）
         shell: pwsh
         run: |
+          $kind = (Get-Content artifact_kind.txt) -replace 'kind=',''
+          if ($kind -eq 'onedir') { $exe = "dist/Excel公式转数值/Excel公式转数值.exe" }
+          else { $exe = "dist/Excel公式转数值.exe" }
+          Write-Host "被测程序: $exe"
           python selftest.py --make-sample smoke.xlsx
-          & "dist/XlsxFormulaToValue.exe" --cli smoke.xlsx smoke_out.xlsx
+          & $exe --cli smoke.xlsx smoke_out.xlsx
           if ($LASTEXITCODE -ne 0) { Write-Error "exe 处理失败，退出码 $LASTEXITCODE"; exit 1 }
           if (-not (Test-Path "smoke_out.xlsx")) { Write-Error "exe 没有生成输出文件"; exit 1 }
           python selftest.py --verify smoke_out.xlsx
           if ($LASTEXITCODE -ne 0) { Write-Error "产物校验失败"; exit 1 }
 
-      - name: 失败时收集构建线索
-        if: failure()
-        shell: pwsh
-        run: |
-          Write-Host "==== build 目录 ===="
-          Get-ChildItem -Recurse build -ErrorAction SilentlyContinue |
-            Select-Object FullName, Length | Format-Table -AutoSize
-          Get-ChildItem build -Recurse -Include "warn-*.txt","xref-*.html" -ErrorAction SilentlyContinue |
-            ForEach-Object { Write-Host "---- $($_.FullName) ----"; Get-Content $_.FullName -TotalCount 100 }
-
-      - uses: actions/upload-artifact@v5
+      - name: 上传产物
+        uses: actions/upload-artifact@v5
         with:
           name: Excel公式转数值-windows
-          path: dist/Excel公式转数值.exe
+          path: |
+            dist/Excel公式转数值.exe
+            dist/Excel公式转数值/**
+          if-no-files-found: error
+
+      - name: 上传构建日志（无论成败）
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: build-logs
+          path: |
+            build_*.log
+            build/*.toc
+            build/warn-*.txt
+          if-no-files-found: warn

@@ -132,6 +132,8 @@ pyinstaller --noconfirm --clean --onefile --windowed ^
 | 同上（另一处风险） | 用 PowerShell 反引号续写多行命令，参数易被截断，pyinstaller 收不到脚本名 | 改为 PowerShell 数组 `$common = @(...)` 单次调用，不用续行符 |
 | 图标嵌入失败风险 | PIL 生成的 ico 每个尺寸都是 **PNG 压缩条目**，PyInstaller 在 Windows 嵌入资源时容易报错 | 改用 `make_ico.py` 生成**纯 BMP 条目**的 ico；工作流仍保留"带图标失败→无图标重试"的自动回退 |
 | Node.js 20 弃用警告 | `checkout@v4`、`setup-python@v5`、`upload-artifact@v4` 都跑在 Node 20 上 | 升级到 `checkout@v5`、`setup-python@v6`、`upload-artifact@v5`（Node 24） |
+| 第二次仍失败：PyInstaller 退出码 1，自检已通过，报错落在日志靠后的 "Building EXE from EXE-00.toc" 阶段 | Windows 运行器的 **Defender 实时防护锁住正在写入的 exe**（`[WinError 5] Access is denied`）；单文件模式要把整个包追加进 exe 尾部，最容易撞上 | ① 构建前把工作目录加入 Defender 排除项；② 打包改**多套配置依次尝试**（onefile → onefile 重试 → 带图标 → onedir），任一套成功即通过；③ 每套日志写进运行页面 Summary 并作为 artifact 留存；④ PyInstaller 固定用已验证版本 6.22.3，失败再退回最新版 |
+| 看不到失败原因 | 日志下载接口需要仓库 admin 权限（403） | 每套尝试的最后 80 行直接写进 `$GITHUB_STEP_SUMMARY`，运行页面 Summary 标签页公开可读，不需要下载日志 |
 
 现在工作流共 11 步，失败点会明确停在某一步；新增两步质量闸门：
 
