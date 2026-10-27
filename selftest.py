@@ -139,6 +139,7 @@ def main():
 
     # 拖拽解析 / 历史记忆
     fails.extend(test_dropped_paths_and_history())
+    fails.extend(test_update_engine())
 
     # 输出路径保护：不允许覆盖源文件
     try:
@@ -157,6 +158,91 @@ def main():
         return 1
     print("\n自检通过：公式已转为数值、值一致、图片单元格保留、源文件未改动。")
     return 0
+
+
+def test_update_engine():
+    """更新引擎：版本比较、清单解析、下载校验、源码态覆盖安装（本地假镜像）。"""
+    import functools
+    import http.server
+    import json
+    import threading
+
+    fails = []
+    # --- 版本比较 ---
+    if not tool.is_newer('1.3', '1.2'):
+        fails.append("1.3 应被判定比 1.2 新")
+    if tool.is_newer('1.2', '1.2'):
+        fails.append("同版本不应提示更新")
+    if tool.is_newer('v1.1.9', '1.2'):
+        fails.append("1.1.9 不应比 1.2 新")
+    if tool.parse_version('v2.0-beta') != (2, 0, 0):
+        fails.append("版本解析异常: %s" % (tool.parse_version('v2.0-beta'),))
+
+    # --- 本地假镜像 ---
+    root = tempfile.mkdtemp(prefix='xlsx_deformula_mirror_')
+    prog = tempfile.mkdtemp(prefix='xlsx_deformula_prog_')
+    open(os.path.join(prog, 'xlsx_deformula.py'), 'w', encoding='utf-8').write('APP_VER = "1.0"\n')
+    open(os.path.join(prog, 'config.json'), 'w', encoding='utf-8').write('{"keep": 1}')
+    newpy = 'APP_VER = "9.9"\n# new\n'.encode('utf-8')
+    with zipfile.ZipFile(os.path.join(root, 'pkg.zip'), 'w') as z:
+        z.writestr('xlsx_deformula/xlsx_deformula.py', newpy)
+        z.writestr('xlsx_deformula/config.json', '{"keep": 999}')
+    pkg = open(os.path.join(root, 'pkg.zip'), 'rb').read()
+    man = {'version': '9.9', 'notes': '自检', 'package': 'pkg.zip',
+           'package_size': len(pkg), 'package_sha256': hashlib.sha256(pkg).hexdigest()}
+    open(os.path.join(root, 'latest.json'), 'w', encoding='utf-8').write(json.dumps(man))
+
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=root)
+    srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    old_env = os.environ.get('XLSX_DEFORMULA_MANIFESTS')
+    os.environ['XLSX_DEFORMULA_MANIFESTS'] = 'http://127.0.0.1:%d/latest.json' % port
+    try:
+        info = tool.check_latest(timeout=5)
+        if not info['has_update'] or info['latest'] != '9.9':
+            fails.append("清单解析异常: %s" % info)
+
+        # sha256 不符必须拒绝
+        bad = dict(man, package_sha256='0' * 64)
+        open(os.path.join(root, 'bad.json'), 'w', encoding='utf-8').write(json.dumps(bad))
+        os.environ['XLSX_DEFORMULA_MANIFESTS'] = 'http://127.0.0.1:%d/bad.json' % port
+        try:
+            tool.install_update(tool.check_latest(timeout=5))
+            fails.append("sha256 不符仍被安装")
+        except tool.UpdateError:
+            pass
+
+        # 源码态覆盖安装：程序文件被替换、用户配置不被覆盖、旧文件有备份
+        os.environ['XLSX_DEFORMULA_MANIFESTS'] = 'http://127.0.0.1:%d/latest.json' % port
+        info = tool.check_latest(timeout=5)
+        old_prog_dir = tool.program_dir
+        old_backup = tool.BACKUP_ROOT
+        tool.program_dir = lambda: prog
+        tool.BACKUP_ROOT = os.path.join(prog, '.update_backup')
+        try:
+            tool.install_update(info)
+        finally:
+            tool.program_dir = old_prog_dir
+            tool.BACKUP_ROOT = old_backup
+        got = open(os.path.join(prog, 'xlsx_deformula.py'), encoding='utf-8').read()
+        if 'APP_VER = "9.9"' not in got:
+            fails.append("源码态更新未覆盖程序文件")
+        if json.load(open(os.path.join(prog, 'config.json'))).get('keep') != 1:
+            fails.append("更新把用户配置覆盖了")
+        if not os.path.isdir(os.path.join(prog, '.update_backup')):
+            fails.append("更新前没有备份旧文件")
+    finally:
+        srv.shutdown()
+        if old_env is None:
+            os.environ.pop('XLSX_DEFORMULA_MANIFESTS', None)
+        else:
+            os.environ['XLSX_DEFORMULA_MANIFESTS'] = old_env
+
+    for f in fails:
+        print("  ✘ " + f)
+    print("更新引擎 测试：%s" % ("失败" if fails else "通过"))
+    return fails
 
 
 def test_dropped_paths_and_history():
