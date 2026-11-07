@@ -42,7 +42,7 @@ import urllib.request
 from xml.sax.saxutils import escape
 
 APP_NAME = "Excel 公式转数值工具"
-APP_VER = "1.2"
+APP_VER = "1.3"
 APP_ID = "xlsx-deformula"
 SUFFIX = "_无公式"
 
@@ -662,11 +662,32 @@ def install_update(info, progress=None):
 
 
 # ---------------------------------------------------------------- 图形界面
+#
+# 视觉规范（v1.3 起）：浅灰底 + 白色卡片 + 单一蓝色强调色，全部用 tkinter 原生
+# 控件自绘，零第三方依赖，Windows / Linux 表现一致。
+#   · 顶部：品牌标识 + 标题 + 版本徽标
+#   · 主体：三张卡片（文件 / 输出位置 / 处理日志），编号圆标 + 充足留白
+#   · 底部：白色操作条，主按钮蓝底白字，其余扁平描边
+# 变量名沿用旧版（btn_run / btn_upd / lst / bar ...），--ui-check 自检依赖它们。
 
 def run_gui(ui_check=False):
     import queue
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
+
+    # ---- 配色与字体 -------------------------------------------------
+    BG = '#f4f6fb'          # 窗口底色
+    CARD = '#ffffff'        # 卡片
+    BORDER = '#e3e8f2'      # 分隔线 / 描边
+    TEXT = '#1b2130'
+    MUTED = '#707a8f'
+    ACCENT = '#2f6bff'
+    ACCENT_DARK = '#1f55d6'
+    ACCENT_SOFT = '#eaf1ff'
+    SUCCESS_C = '#0f8a5f'
+    WARN_C = '#b26a00'
+    ERROR_C = '#c93636'
+    FIELD_BG = '#fbfcff'
 
     # 拖拽组件（tkdnd 的 Python 包装）；缺失或异常时不崩，退回按钮选文件。
     # 设置环境变量 XLSX_DEFORMULA_NO_DND=1 可强制关闭拖拽（排障用）。
@@ -691,17 +712,22 @@ def run_gui(ui_check=False):
 
     root.title("%s v%s" % (APP_NAME, APP_VER))
     # 初始尺寸只是占位，真正的高度在下面按控件实际需求自适应（见 fit_window()）
-    root.geometry("860x760")
-    root.minsize(760, 620)
+    root.geometry("900x800")
+    root.minsize(780, 640)
+    root.configure(bg=BG)
 
     # 选一个带中文的界面字体（Windows 用微软雅黑，其余平台依次回退）
+    FAM = 'TkDefaultFont'
+    MONO = 'Courier New'
     try:
         import tkinter.font as tkfont
         avail = set(tkfont.families())
         for fam in ("Microsoft YaHei UI", "Microsoft YaHei", "微软雅黑",
-                    "PingFang SC", "Noto Sans CJK SC", "WenQuanYi Zen Hei",
-                    "SimHei", "宋体", "DejaVu Sans"):
+                    "PingFang SC", "Noto Sans SC", "Noto Sans CJK SC",
+                    "WenQuanYi Zen Hei", "wenquanyi bitmap song",
+                    "WenQuanYi Bitmap Song", "SimHei", "宋体", "DejaVu Sans"):
             if fam in avail:
+                FAM = fam
                 for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont",
                              "TkHeadingFont", "TkCaptionFont", "TkTooltipFont"):
                     try:
@@ -709,8 +735,196 @@ def run_gui(ui_check=False):
                     except Exception:
                         pass
                 break
+        for fam in ("Consolas", "Cascadia Mono", "JetBrains Mono", "Menlo",
+                    "DejaVu Sans Mono", "Noto Sans Mono", "Courier New"):
+            if fam in avail:
+                MONO = fam
+                break
     except Exception:
         pass
+
+    # ---- ttk 主题：统一成扁平浅色 ----------------------------------
+    style = ttk.Style(root)
+    try:
+        style.theme_use('clam')
+    except Exception:
+        pass
+    style.configure('.', background=BG, foreground=TEXT, font=(FAM, 10))
+    style.configure('Card.TFrame', background=CARD)
+    style.configure('Card.TLabel', background=CARD, foreground=TEXT)
+    style.configure('Card.TRadiobutton', background=CARD, foreground=TEXT,
+                    indicatorcolor=FIELD_BG, focuscolor=CARD, padding=(0, 2))
+    style.map('Card.TRadiobutton',
+              background=[('active', CARD)],
+              indicatorcolor=[('selected', ACCENT), ('active', ACCENT_SOFT),
+                              ('pressed', ACCENT)])
+    style.configure('Card.TCheckbutton', background=CARD, foreground=TEXT,
+                    indicatorcolor=FIELD_BG, focuscolor=CARD, padding=(0, 2))
+    style.map('Card.TCheckbutton',
+              background=[('active', CARD)],
+              indicatorcolor=[('selected', ACCENT), ('active', ACCENT_SOFT)])
+    style.configure('Field.TEntry', fieldbackground=FIELD_BG, foreground=TEXT,
+                    bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
+                    insertcolor=TEXT, padding=6)
+    style.map('Field.TEntry', bordercolor=[('focus', ACCENT)],
+              lightcolor=[('focus', ACCENT)], darkcolor=[('focus', ACCENT)])
+    style.configure('Field.TCombobox', fieldbackground=FIELD_BG, background=FIELD_BG,
+                    foreground=TEXT, bordercolor=BORDER, lightcolor=BORDER,
+                    darkcolor=BORDER, arrowcolor=MUTED, padding=5)
+    style.map('Field.TCombobox',
+              fieldbackground=[('readonly', FIELD_BG), ('focus', '#ffffff')],
+              bordercolor=[('focus', ACCENT)],
+              lightcolor=[('focus', ACCENT)], darkcolor=[('focus', ACCENT)])
+    style.configure('Accent.Horizontal.TProgressbar', troughcolor='#e9eef8',
+                    background=ACCENT, bordercolor='#e9eef8',
+                    lightcolor=ACCENT, darkcolor=ACCENT, thickness=6)
+    style.configure('Card.Vertical.TScrollbar', background='#c9d2e4',
+                    troughcolor=CARD, bordercolor=CARD, arrowcolor=MUTED,
+                    lightcolor=CARD, darkcolor=CARD, width=10)
+    root.option_add('*TCombobox*Listbox.background', CARD)
+    root.option_add('*TCombobox*Listbox.foreground', TEXT)
+    root.option_add('*TCombobox*Listbox.selectBackground', ACCENT_SOFT)
+    root.option_add('*TCombobox*Listbox.selectForeground', TEXT)
+    root.option_add('*TCombobox*Listbox.borderWidth', 0)
+
+    # ---- 自绘控件 ---------------------------------------------------
+    def round_rect(cv, x1, y1, x2, y2, r, **kw):
+        pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+               x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+               x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+        return cv.create_polygon(pts, smooth=True, **kw)
+
+    def flat_button(parent, text, command, kind='secondary', **kw):
+        """扁平按钮：外层 1px 描边框 + 内层无边框按钮，保证边框颜色可控。"""
+        fills = {
+            'primary': (ACCENT, '#ffffff', ACCENT_DARK),
+            'secondary': ('#ffffff', TEXT, ACCENT_SOFT),
+            'ghost': (CARD, MUTED, '#eef2f9'),
+        }
+        fill, fg, hover = fills.get(kind, fills['secondary'])
+        edge = ACCENT if kind == 'primary' else (BORDER if kind == 'secondary' else CARD)
+        holder = tk.Frame(parent, bg=edge, bd=0, highlightthickness=0)
+        btn = tk.Button(holder, text=text, command=command, relief='flat', bd=0,
+                        bg=fill, fg=fg, activebackground=hover, activeforeground=fg,
+                        disabledforeground='#9aa6bd', cursor='hand2',
+                        padx=kw.get('padx', 16), pady=kw.get('pady', 6),
+                        font=(FAM, 10, 'bold' if kind == 'primary' else 'normal'),
+                        highlightthickness=0, takefocus=0)
+        btn.pack(fill='both', expand=True, padx=1, pady=1)
+
+        def on_enter(_e=None):
+            if str(btn.cget('state')) != 'disabled':
+                btn.configure(bg=hover)
+
+        def on_leave(_e=None):
+            btn.configure(bg=holder.fill)
+
+        btn.bind('<Enter>', on_enter)
+        btn.bind('<Leave>', on_leave)
+        holder.btn = btn
+        holder.fill = fill
+
+        def configure(**k):
+            direct = {kk: vv for kk, vv in k.items()
+                      if kk in ('text', 'state', 'command', 'bg', 'fg', 'cursor')}
+            if 'bg' in direct:
+                holder.fill = direct['bg']
+            rest = {kk: vv for kk, vv in k.items() if kk not in direct}
+            if direct:
+                btn.configure(**direct)
+            if rest:
+                tk.Frame.configure(holder, **rest)
+
+        def cget(key):
+            if key in ('text', 'state', 'bg', 'fg'):
+                return btn.cget(key)
+            return tk.Frame.cget(holder, key)
+
+        def keys():
+            ks = list(tk.Frame.keys(holder))
+            return ks + [k for k in ('text', 'state') if k not in ks]
+
+        holder.configure = configure
+        holder.config = configure
+        holder.cget = cget
+        holder.keys = keys
+        return holder
+
+    def make_card(parent, num, title, hint=''):
+        """带编号徽标的白色卡片。返回 (卡片, 内容区)。"""
+        card = tk.Frame(parent, bg=CARD, highlightbackground=BORDER,
+                        highlightcolor=BORDER, highlightthickness=1, bd=0)
+        head = tk.Frame(card, bg=CARD)
+        head.pack(fill='x', padx=14, pady=(10, 6))
+        badge = tk.Canvas(head, width=20, height=20, bg=CARD, highlightthickness=0)
+        badge.create_oval(0, 0, 19, 19, fill=ACCENT_SOFT, outline='')
+        badge.create_text(10, 10, text=str(num), fill=ACCENT,
+                          font=(FAM, 8, 'bold'))
+        badge.pack(side='left')
+        tk.Label(head, text=title, bg=CARD, fg=TEXT,
+                 font=(FAM, 11, 'bold')).pack(side='left', padx=(8, 0))
+        if hint:
+            tk.Label(head, text=hint, bg=CARD, fg=MUTED,
+                     font=(FAM, 9)).pack(side='right')
+        body = tk.Frame(card, bg=CARD)
+        body.pack(fill='both', expand=True, padx=14, pady=(0, 10))
+        return card, body
+
+    def choice_row(parent, kind, text, variable, value=True):
+        """自绘单选/复选框：Canvas 指示器 + 文字，点击整行切换。
+
+        不用 ttk 自带 indicator —— clam 主题下的勾选符依赖字体，缺字时会变成方块。
+        """
+        row = tk.Frame(parent, bg=CARD)
+        cv = tk.Canvas(row, width=18, height=18, bg=CARD,
+                       highlightthickness=0, cursor='hand2')
+        cv.pack(side='left', padx=(0, 8))
+        lbl = tk.Label(row, text=text, bg=CARD, fg=TEXT, font=(FAM, 10),
+                       cursor='hand2')
+        lbl.pack(side='left')
+
+        def redraw(_a=None, _b=None, _c=None):
+            on = (variable.get() == value) if kind == 'radio' else bool(variable.get())
+            cv.delete('all')
+            if kind == 'radio':
+                cv.create_oval(1.5, 1.5, 16.5, 16.5, fill='#ffffff',
+                               outline=ACCENT if on else '#b9c3d6', width=2)
+                if on:
+                    cv.create_oval(5.5, 5.5, 12.5, 12.5, fill=ACCENT, outline='')
+            elif on:
+                cv.create_rectangle(1, 1, 17, 17, fill=ACCENT, outline=ACCENT, width=1)
+                cv.create_line(5, 9, 8, 12.5, 13, 5.5, fill='#ffffff', width=2,
+                               capstyle='round', joinstyle='round')
+            else:
+                cv.create_rectangle(1, 1, 17, 17, fill='#ffffff',
+                                    outline='#b9c3d6', width=1)
+            return on
+
+        def click(_e=None):
+            if kind == 'radio':
+                variable.set(value)
+            else:
+                variable.set(not bool(variable.get()))
+            return 'break'
+
+        def hover(on):
+            if kind == 'radio':
+                if variable.get() != value:
+                    cv.itemconfigure(1, outline=ACCENT if on else '#b9c3d6')
+            elif not variable.get():
+                cv.itemconfigure(1, outline=ACCENT if on else '#b9c3d6')
+
+        for w in (row, cv, lbl):
+            w.bind('<Button-1>', click)
+            w.bind('<Enter>', lambda e: hover(True))
+            w.bind('<Leave>', lambda e: hover(False))
+        try:
+            variable.trace_add('write', redraw)
+        except Exception:
+            pass
+        redraw()
+        return row
+
 
     cfg = load_config()
     files = []
@@ -719,49 +933,152 @@ def run_gui(ui_check=False):
     outfile = tk.StringVar(value='')
     keep_links = tk.BooleanVar(value=True)
     running = {'v': False}
-    pad = {'padx': 8, 'pady': 4}
 
-    # ---------- ① 文件（支持拖拽） ----------
-    f1 = ttk.LabelFrame(root, text="① 要处理的 Excel 文件（原始文件只读，不会被修改）")
-    f1.pack(fill='both', expand=False, **pad)
+    # ---------- 顶部品牌区 ----------
+    header = tk.Frame(root, bg=CARD)
+    header.pack(fill='x')
+    hrow = tk.Frame(header, bg=CARD)
+    hrow.pack(fill='x', padx=18, pady=(14, 12))
 
+    logo = tk.Canvas(hrow, width=40, height=40, bg=CARD, highlightthickness=0)
+    logo.pack(side='left')
+    round_rect(logo, 0, 0, 39, 39, 10, fill=ACCENT, outline='')
+    logo.create_text(20, 20, text='fx', fill='#ffffff', font=(FAM, 15, 'bold'))
+
+    title_box = tk.Frame(hrow, bg=CARD)
+    title_box.pack(side='left', padx=(12, 0))
+    tk.Label(title_box, text=APP_NAME, bg=CARD, fg=TEXT,
+             font=(FAM, 15, 'bold')).pack(anchor='w')
+    subtitle = tk.Label(title_box,
+                        text='公式 → 数值 · 保留图表 / 图片 / 格式 · 原始文件只读',
+                        bg=CARD, fg=MUTED, font=(FAM, 9))
+    subtitle.pack(anchor='w', pady=(2, 0))
+
+    tk.Label(hrow, text='v%s' % APP_VER, bg=ACCENT_SOFT, fg=ACCENT,
+             font=(FAM, 9, 'bold'), padx=10, pady=3).pack(side='right')
+    tk.Frame(root, bg=BORDER, height=1).pack(fill='x')
+
+    # ---------- 底部操作条（先占位，窗口再矮也不会被挤掉） ----------
+    footer = tk.Frame(root, bg=CARD)
+    footer.pack(side='bottom', fill='x')
+    tk.Frame(footer, bg=BORDER, height=1).pack(fill='x')
+    bar2 = tk.Frame(footer, bg=CARD)
+    bar2.pack(fill='x', padx=14, pady=10)
+
+    # ---------- 内容区 ----------
+    content = tk.Frame(root, bg=BG)
+    content.pack(fill='both', expand=True, padx=14, pady=12)
+
+    # ---------- ① 文件 ----------
+    card1, body1 = make_card(content, 1, '要处理的 Excel 文件',
+                             '拖入或选择 · .xlsx / .xlsm')
+    card1.pack(fill='x')
+
+    hover_state = {'v': False}
     if HAS_DND:
-        drop_hint = "把 Excel 文件（或整个文件夹）拖到这里 —— 支持一次拖多个\n也可以点这里 / 下方「添加文件…」按钮选择"
+        drop_title = '把 Excel 文件（或整个文件夹）拖到这里'
+        drop_sub = '支持一次多个 · 也可以点击这里或「添加文件」按钮选择'
     else:
-        drop_hint = "当前运行环境缺少拖拽组件（tkdnd），请点这里或「添加文件…」按钮选择文件"
-    drop_zone = tk.Label(f1, text=drop_hint, height=3, relief='groove', bd=2,
-                         bg='#eef4ff', fg='#20406b', justify='center', cursor='hand2')
-    drop_zone.pack(fill='x', padx=8, pady=(8, 4))
+        drop_title = '当前运行环境缺少拖拽组件'
+        drop_sub = '请点击这里或「添加文件」按钮选择 Excel 文件'
 
-    body = ttk.Frame(f1)
-    body.pack(fill='both', expand=True, padx=8, pady=(0, 8))
-    lst = tk.Listbox(body, height=7, selectmode='extended')
-    lst.pack(side='left', fill='both', expand=True)
-    sb = ttk.Scrollbar(body, orient='vertical', command=lst.yview)
-    sb.pack(side='left', fill='y')
+    drop_zone = tk.Canvas(body1, height=82, bg=CARD, highlightthickness=0,
+                          cursor='hand2')
+    drop_zone.pack(fill='x')
+
+    def draw_drop(*_a):
+        w = max(drop_zone.winfo_width(), 240)
+        h = 82
+        drop_zone.delete('all')
+        hot = hover_state['v']
+        drop_zone.create_rectangle(1, 1, w - 1, h - 1,
+                                   fill='#eef4ff' if hot else '#fafbff',
+                                   outline=ACCENT if hot else '#cbd8ef',
+                                   dash=(6, 4), width=1)
+        cx = w / 2
+        cy = 23
+        drop_zone.create_oval(cx - 15, cy - 15, cx + 15, cy + 15,
+                              fill=ACCENT_SOFT, outline='')
+        drop_zone.create_line(cx, cy - 7, cx, cy + 4, fill=ACCENT, width=2,
+                              capstyle='round')
+        drop_zone.create_line(cx - 5, cy - 1, cx, cy + 5, cx + 5, cy - 1,
+                              fill=ACCENT, width=2, capstyle='round',
+                              joinstyle='round')
+        drop_zone.create_line(cx - 6, cy + 7, cx + 6, cy + 7, fill=ACCENT,
+                              width=2, capstyle='round')
+        drop_zone.create_text(cx, 54, text=drop_title, fill=TEXT,
+                              font=(FAM, 10, 'bold'))
+        drop_zone.create_text(cx, 70, text=drop_sub, fill=MUTED, font=(FAM, 9))
+
+    drop_zone.bind('<Configure>', draw_drop)
+    drop_zone.bind('<Enter>',
+                   lambda e: (hover_state.__setitem__('v', True), draw_drop()))
+    drop_zone.bind('<Leave>',
+                   lambda e: (hover_state.__setitem__('v', False), draw_drop()))
+
+    list_row = tk.Frame(body1, bg=CARD)
+    list_row.pack(fill='both', expand=True, pady=(10, 0))
+
+    list_wrap = tk.Frame(list_row, bg=FIELD_BG,
+                         highlightbackground=BORDER, highlightthickness=1)
+    list_wrap.pack(side='left', fill='both', expand=True)
+
+    lst = tk.Listbox(list_wrap, height=5, bd=0, relief='flat',
+                     highlightthickness=0, bg=FIELD_BG, fg=TEXT,
+                     selectmode='extended', activestyle='none',
+                     selectbackground=ACCENT_SOFT, selectforeground=TEXT,
+                     font=(FAM, 9))
+    lst.pack(side='left', fill='both', expand=True, padx=(8, 0), pady=6)
+    sb = ttk.Scrollbar(list_wrap, orient='vertical', command=lst.yview,
+                       style='Card.Vertical.TScrollbar')
+    sb.pack(side='right', fill='y', padx=(2, 4), pady=6)
     lst.configure(yscrollcommand=sb.set)
 
-    btns = ttk.Frame(body)
-    btns.pack(side='right', fill='y', padx=(8, 0))
-    cnt = tk.StringVar(value="已选 0 个文件")
+    empty_lbl = tk.Label(list_wrap, text='还没有添加文件\n拖入或点「添加文件」开始',
+                         bg=FIELD_BG, fg=MUTED, justify='center',
+                         font=(FAM, 9))
+    empty_lbl.place(relx=0.5, rely=0.5, anchor='center')
+    empty_lbl.lift()
 
+    cnt = tk.StringVar(value="已选 0 个文件")
     log_holder = {}
 
     def logln(s):
         box = log_holder.get('box')
         if box is None:
             return
+        t = s.lstrip()
+        tag = ''
+        if t.startswith('='):
+            tag = 'dim'
+        elif t.startswith('✔'):
+            tag = 'ok'
+        elif t.startswith('✘'):
+            tag = 'err'
+        elif '⚠' in t:
+            tag = 'warn'
+        elif '输出 →' in t:
+            tag = 'path'
+        elif t.startswith('[') and ']' in t:
+            tag = 'head'
         box.configure(state='normal')
-        box.insert('end', s + "\n")
+        box.insert('end', s + "\n", tag)
         box.see('end')
         box.configure(state='disabled')
         root.update_idletasks()
 
     def refresh():
         lst.delete(0, 'end')
-        for f in files:
+        for i, f in enumerate(files):
             lst.insert('end', f)
+            if i % 2:
+                lst.itemconfig(i, background='#f6f9fe')   # 斑马纹
         cnt.set("已选 %d 个文件" % len(files))
+        if files:
+            empty_lbl.place_forget()
+        else:
+            empty_lbl.place(relx=0.5, rely=0.5, anchor='center')
+            empty_lbl.lift()
 
     def add_paths(paths, rejected=()):
         added = 0
@@ -801,10 +1118,17 @@ def run_gui(ui_check=False):
         if found or ignored:
             add_paths(found, ignored)
 
-    ttk.Button(btns, text="添加文件…", command=add_files).pack(fill='x', pady=2)
-    ttk.Button(btns, text="移除选中", command=del_sel).pack(fill='x', pady=2)
-    ttk.Button(btns, text="清空列表", command=clear_all).pack(fill='x', pady=2)
-    ttk.Label(btns, textvariable=cnt).pack(fill='x', pady=(8, 0))
+    btn_col = tk.Frame(list_row, bg=CARD)
+    btn_col.pack(side='right', fill='y', padx=(10, 0))
+    flat_button(btn_col, '添加文件', add_files, 'primary',
+                pady=6).pack(fill='x')
+    flat_button(btn_col, '移除选中', del_sel, pady=5).pack(fill='x', pady=(6, 0))
+    flat_button(btn_col, '清空列表', clear_all, pady=5).pack(fill='x', pady=(6, 0))
+    tk.Label(btn_col, textvariable=cnt, bg=CARD, fg=MUTED,
+             font=(FAM, 9)).pack(anchor='w', pady=(10, 0))
+
+    empty_lbl.bind('<Button-1>', lambda e: add_files())
+    drop_zone.bind('<Button-1>', lambda e: add_files())
 
     if HAS_DND:
         for widget in (root, drop_zone, lst):
@@ -813,19 +1137,21 @@ def run_gui(ui_check=False):
                 widget.dnd_bind('<<Drop>>', on_drop)
             except Exception:
                 pass
-    drop_zone.bind('<Button-1>', lambda e: add_files())
 
     # ---------- ② 输出位置 ----------
-    f2 = ttk.LabelFrame(root, text="② 输出位置")
-    f2.pack(fill='x', **pad)
-    ttk.Radiobutton(f2, text="与原文件同目录（文件名自动加 “%s”）" % SUFFIX,
-                    variable=mode, value='same').grid(row=0, column=0, sticky='w',
-                                                      padx=8, pady=3, columnspan=4)
-    ttk.Radiobutton(f2, text="输出到指定文件夹：", variable=mode, value='dir'
-                    ).grid(row=1, column=0, sticky='w', padx=8, pady=3)
+    card2, body2 = make_card(content, 2, '输出位置', '每次启动需重新选择')
+    card2.pack(fill='x', pady=(12, 0))
+    body2.columnconfigure(1, weight=1)
+
+    choice_row(body2, 'radio', "与原文件同目录（文件名自动加「%s」）" % SUFFIX,
+               mode, 'same').grid(row=0, column=0, columnspan=3, sticky='w',
+                                  pady=(0, 2))
+    choice_row(body2, 'radio', "输出到指定文件夹：", mode, 'dir').grid(
+        row=1, column=0, sticky='w', padx=(0, 10), pady=3)
 
     hist = list(cfg.get('output_history', []))
-    cb_dir = ttk.Combobox(f2, textvariable=outdir, values=hist, width=52)
+    cb_dir = ttk.Combobox(body2, textvariable=outdir, values=hist, width=52,
+                          style='Field.TCombobox')
     cb_dir.grid(row=1, column=1, sticky='we', pady=3)
 
     def on_hist(_evt=None):
@@ -843,11 +1169,13 @@ def run_gui(ui_check=False):
             outdir.set(d)
             mode.set('dir')
 
-    ttk.Button(f2, text="浏览…", command=pick_dir).grid(row=1, column=2, padx=6)
+    flat_button(body2, '浏览…', pick_dir, padx=12, pady=3).grid(
+        row=1, column=2, padx=(8, 0), pady=3)
 
-    ttk.Radiobutton(f2, text="保存为指定文件（仅单个源文件时）：", variable=mode, value='file'
-                    ).grid(row=2, column=0, sticky='w', padx=8, pady=3)
-    ttk.Entry(f2, textvariable=outfile, width=52).grid(row=2, column=1, sticky='we', pady=3)
+    choice_row(body2, 'radio', "保存为指定文件（仅单个源文件时）：", mode, 'file').grid(
+        row=2, column=0, sticky='w', padx=(0, 10), pady=3)
+    ttk.Entry(body2, textvariable=outfile, width=52,
+              style='Field.TEntry').grid(row=2, column=1, sticky='we', pady=3)
 
     def pick_file():
         p = filedialog.asksaveasfilename(title="另存为", defaultextension=".xlsx",
@@ -855,37 +1183,53 @@ def run_gui(ui_check=False):
         if p:
             outfile.set(p)
             mode.set('file')
-    ttk.Button(f2, text="浏览…", command=pick_file).grid(row=2, column=2, padx=6)
-    f2.columnconfigure(1, weight=1)
+
+    flat_button(body2, '浏览…', pick_file, padx=12, pady=3).grid(
+        row=2, column=2, padx=(8, 0), pady=3)
 
     hist_state = tk.StringVar(
-        value=("历史输出文件夹：%d 个，可下拉直接选" % len(hist)) if hist
-        else "历史输出文件夹：暂无（选过一次后自动记住，最多 10 个）")
-    ttk.Label(f2, textvariable=hist_state, foreground='#55607a').grid(
-        row=3, column=1, sticky='w', pady=(0, 4))
-    ttk.Label(f2, text="提示：每次打开程序都需要重新选择输出文件夹（历史目录可下拉快选）。",
-              foreground='#8a5a00').grid(row=4, column=0, sticky='w', padx=8, pady=(0, 6),
-                                         columnspan=4)
+        value=("历史输出文件夹：%d 个，可下拉速选" % len(hist)) if hist
+        else "历史输出文件夹：暂无（选过自动记住，最多 10 个）")
 
-    # 底部按钮条先占位（side='bottom'），窗口再矮也不会把按钮挤出可视区
-    bar2 = ttk.Frame(root)
-    bar2.pack(side='bottom', fill='x', padx=8, pady=(0, 8))
+    hint_bar = tk.Frame(body2, bg='#fff8e8')
+    hint_bar.grid(row=3, column=0, columnspan=3, sticky='we', pady=(6, 0))
+    tk.Label(hint_bar, textvariable=hist_state, bg='#fff8e8', fg='#8a5a00',
+             font=(FAM, 9)).pack(side='left', padx=10, pady=4)
+    tk.Label(hint_bar, text='每次打开程序都需重新选择输出文件夹',
+             bg='#fff8e8', fg='#b07a2a', font=(FAM, 9)).pack(
+        side='right', padx=10, pady=4)
 
-    opt = ttk.Frame(root)
-    opt.pack(fill='x', padx=8)
-    ttk.Checkbutton(opt, text="保留对外部工作簿的引用（一般保留即可）",
-                    variable=keep_links).pack(side='left')
+    choice_row(body2, 'check', "保留对外部工作簿的引用（一般保留即可）",
+               keep_links).grid(row=5, column=0, columnspan=3, sticky='w',
+                                pady=(6, 0))
 
-    # ---------- 运行区 ----------
-    f3 = ttk.Frame(root)
-    f3.pack(fill='both', expand=True, **pad)
-    bar = ttk.Progressbar(f3, mode='determinate', maximum=100)
-    bar.pack(fill='x', pady=(2, 4))
-    log_box = tk.Text(f3, height=11, wrap='word', state='disabled')
+    # ---------- ③ 运行区 ----------
+    card3, body3 = make_card(content, 3, '处理日志', '原始文件全程只读')
+    card3.pack(fill='both', expand=True, pady=(12, 0))
+
+    bar = ttk.Progressbar(body3, mode='determinate', maximum=100,
+                          style='Accent.Horizontal.TProgressbar')
+    bar.pack(fill='x', pady=(0, 8))
+
+    log_wrap = tk.Frame(body3, bg=CARD)
+    log_wrap.pack(fill='both', expand=True)
+    log_box = tk.Text(log_wrap, height=8, wrap='word', state='disabled', bd=0,
+                      relief='flat', bg=FIELD_BG, fg='#39415a',
+                      insertbackground=TEXT, font=(MONO, 9), padx=10, pady=8,
+                      highlightthickness=1, highlightbackground=BORDER,
+                      highlightcolor=BORDER, selectbackground=ACCENT_SOFT,
+                      selectforeground=TEXT)
     log_box.pack(fill='both', expand=True, side='left')
-    lgsb = ttk.Scrollbar(f3, orient='vertical', command=log_box.yview)
+    lgsb = ttk.Scrollbar(log_wrap, orient='vertical', command=log_box.yview,
+                         style='Card.Vertical.TScrollbar')
     lgsb.pack(side='right', fill='y')
     log_box.configure(yscrollcommand=lgsb.set)
+    log_box.tag_configure('ok', foreground=SUCCESS_C)
+    log_box.tag_configure('err', foreground=ERROR_C)
+    log_box.tag_configure('warn', foreground=WARN_C)
+    log_box.tag_configure('path', foreground=ACCENT)
+    log_box.tag_configure('dim', foreground='#c2c9d8')
+    log_box.tag_configure('head', foreground=TEXT, font=(MONO, 9, 'bold'))
     log_holder['box'] = log_box
 
     def set_prog(frac):
@@ -990,10 +1334,10 @@ def run_gui(ui_check=False):
         else:
             os.system('xdg-open "%s"' % d)
 
-    btn_run = ttk.Button(bar2, text="开始转换", command=start)
+    btn_run = flat_button(bar2, '开始转换', start, 'primary', padx=22, pady=7)
     btn_run.pack(side='left')
-    btn_open = ttk.Button(bar2, text="打开输出文件夹", command=open_out)
-    btn_open.pack(side='left', padx=6)
+    btn_open = flat_button(bar2, '打开输出文件夹', open_out)
+    btn_open.pack(side='left', padx=(8, 0))
 
     # ---------- 更新（手动检查 + 启动静默检查） ----------
     upd = {'info': None, 'busy': False}
@@ -1102,16 +1446,19 @@ def run_gui(ui_check=False):
         else:
             do_check(manual=True)
 
-    btn_upd = ttk.Button(bar2, text="检查更新", command=on_update_click)
-    btn_upd.pack(side='left', padx=6)
-    ver_lbl = ttk.Label(bar2, text="v%s" % APP_VER, foreground='#55607a')
-    ver_lbl.pack(side='left', padx=(2, 0))
-    ttk.Button(bar2, text="退出", command=root.destroy).pack(side='right')
+    btn_exit = flat_button(bar2, '退出', root.destroy, 'ghost', padx=14, pady=6)
+    btn_exit.pack(side='right')
+    ver_lbl = tk.Label(bar2, text="v%s" % APP_VER, bg=CARD, fg=MUTED,
+                       font=(FAM, 9))
+    ver_lbl.pack(side='right', padx=(0, 12))
+    btn_upd = flat_button(bar2, '检查更新', on_update_click, 'ghost',
+                          padx=14, pady=6)
+    btn_upd.pack(side='right', padx=(0, 14))
 
     def fit_window():
         """按控件实际需求高宽定窗口，保证所有按钮（含最底部一排）都在屏幕内。"""
         root.update_idletasks()
-        want_w = max(root.winfo_reqwidth(), 760)
+        want_w = max(root.winfo_reqwidth(), 780)
         want_h = root.winfo_reqheight()
         sw = root.winfo_screenwidth()
         shp = root.winfo_screenheight()
@@ -1127,20 +1474,63 @@ def run_gui(ui_check=False):
                 cur = int(log_box.cget('height'))
             except Exception:
                 cur = 0
-            if cur <= 4:
+            if cur <= 5:
                 break
-            log_box.configure(height=cur - 2)
-        h = min(max(root.winfo_reqheight(), 620), h_max)
+            log_box.configure(height=max(5, cur - 1))
+        # 仍然放不下时再压缩文件列表（日志已到最小可读高度）
+        for _ in range(3):
+            root.update_idletasks()
+            if root.winfo_reqheight() <= h_max:
+                break
+            try:
+                cur = int(lst.cget('height'))
+            except Exception:
+                cur = 0
+            if cur <= 3:
+                break
+            lst.configure(height=cur - 1)
+        # 小屏（如 1366×768）仍放不下时，收起拖拽区，保住日志与底部按钮
+        if root.winfo_reqheight() > h_max:
+            try:
+                if drop_zone.winfo_ismapped():
+                    drop_zone.pack_forget()
+                    root.update_idletasks()
+            except Exception:
+                pass
+        # 再放不下就把日志压到 3 行（宁可少几行，也不能出现半行截断）
+        for _ in range(4):
+            root.update_idletasks()
+            if root.winfo_reqheight() <= h_max:
+                break
+            try:
+                cur = int(log_box.cget('height'))
+            except Exception:
+                break
+            if cur <= 3:
+                break
+            log_box.configure(height=cur - 1)
+        # 极矮屏幕：收起顶部副标题与内容区留白，尽量把日志留在可视区
+        if root.winfo_reqheight() > h_max:
+            try:
+                subtitle.pack_forget()
+                content.pack_configure(pady=8)
+                hrow.pack_configure(pady=(9, 8))
+                bar2.pack_configure(pady=8)
+                root.update_idletasks()
+            except Exception:
+                pass
+        h = min(max(root.winfo_reqheight() + 10, 640), h_max)
         x = max((sw - w) // 2, 0)
         y = max((shp - h) // 3, 0)
         root.geometry("%dx%d+%d+%d" % (w, h, x, y))
-        root.minsize(min(w, root.winfo_reqwidth()), min(h, 560))
+        root.minsize(min(w, root.winfo_reqwidth()), min(h, 600))
 
-    logln("%s v%s 就绪。原始文件全程只读，结果另存为新文件。" % (APP_NAME, APP_VER))
+    logln("%s v%s 就绪。原始文件全程只读，结果另存为新文件。"
+          % (APP_NAME, APP_VER))
     if HAS_DND:
         logln("支持拖拽：把 .xlsx / .xlsm 文件（或整个文件夹）直接拖进窗口即可加入列表。")
     else:
-        logln("提示：当前环境缺少拖拽组件（tkdnd），请用「添加文件…」按钮选择文件。")
+        logln("提示：当前环境缺少拖拽组件（tkdnd），请用「添加文件」按钮选择文件。")
     logln("输出文件夹每次打开都要重新选择；选过的目录会进入历史记录，可从下拉列表直接挑。")
 
     fit_window()
@@ -1164,7 +1554,7 @@ def run_gui(ui_check=False):
                 'widgets': {},
             }
             for name, w in (('btn_run', btn_run), ('btn_open', btn_open),
-                            ('btn_update', btn_upd), ('btn_exit', bar2.winfo_children()[-1]),
+                            ('btn_update', btn_upd), ('btn_exit', btn_exit),
                             ('log_box', log_box), ('listbox', lst)):
                 try:
                     report['widgets'][name] = {
@@ -1188,6 +1578,8 @@ def run_gui(ui_check=False):
 
     root.mainloop()
     return 0
+
+
 def main():
     # PyInstaller --windowed 冻结环境下 stdout/stderr 可能是 None，
     # 此时 print/write 会抛异常，统一重定向到 devnull。
