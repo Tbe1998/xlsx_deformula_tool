@@ -14,7 +14,8 @@ Excel 公式转数值工具 (Excel Formula to Value)
 4) 保留图表、图片、合并单元格、条件格式、行高列宽——只在 XML 层剥离 <f> 公式，
    保留公式的缓存计算结果 <v>，不用 openpyxl 重新保存（会丢图表）
 5) 自带更新：启动 1.5 秒后后台静默检查 NAS 镜像上的 latest.json（局域网优先、
-   公网 HTTPS 兜底），底栏「检查更新」可手动检查并一键下载安装（校验 sha256）
+   公网 HTTPS 兜底），底栏「检查更新」可手动检查并一键下载安装（校验 sha256）；
+   下载成功后自动关闭→替换→重启，全程隐藏执行（不弹 cmd 窗口），失败会弹提示并写日志
 
 零第三方依赖：仅用 Python 标准库（tkinter + zipfile + re）。
 可作为命令行工具使用：  python xlsx_deformula.py --cli 源文件.xlsx [输出.xlsx]
@@ -42,7 +43,7 @@ import urllib.request
 from xml.sax.saxutils import escape
 
 APP_NAME = "Excel 公式转数值工具"
-APP_VER = "1.3"
+APP_VER = "1.4"
 APP_ID = "xlsx-deformula"
 SUFFIX = "_无公式"
 
@@ -614,51 +615,108 @@ def _short_path(path):
 
 
 def apply_exe_update(new_exe, version_tag=""):
-    """exe 形态：写一个替换脚本，等本进程退出后换掉 exe 并重新拉起。"""
-    target = os.path.abspath(sys.executable)
-    tgt = _short_path(target) if os.name == "nt" else target
-    src = _short_path(new_exe) if os.name == "nt" else new_exe
+    """exe 形态：写一个隐藏的 VBS 替换脚本，等本进程退出后换掉 exe 并重新拉起。
+
+    为什么不再用 cmd/bat：
+      · cmd 窗口会闪一下，用户看到控制台却没后续，体验像是卡死；
+      · bat 里 wait 父进程、move 失败都没有反馈，失败就静默结束。
+    现在改成 wscript 隐藏执行 VBS：没有控制台窗口，替换失败会弹原生对话框并写日志。
+    """
     if os.name != "nt":
         raise UpdateError("当前不是 Windows 可执行文件形态，无法自替换")
-    bat = os.path.join(tempfile.gettempdir(), "xlsx-deformula-update-%d.bat" % os.getpid())
-    pid = os.getpid()
-    lines = [
-        "@echo off",
-        "chcp 65001>nul",
-        ":wait",
-        "tasklist /FI \"PID eq %d\" 2>nul | find \"%d\" >nul" % (pid, pid),
-        "if not errorlevel 1 (",
-        "  ping -n 2 127.0.0.1 >nul",
-        "  goto wait",
-        ")",
-        "move /y \"%s\" \"%s\" >nul" % (src, tgt),
-        "start \"\" \"%s\"" % tgt,
-        "del \"%%~f0\"",
-    ]
-    with open(bat, "w", encoding="ascii", newline="\r\n") as f:
-        f.write("\n".join(lines) + "\n")
-    flags = 0
-    if os.name == "nt":
-        flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
-                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                 | getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    subprocess.Popen(["cmd", "/c", bat], close_fds=True, creationflags=flags,
+    target = os.path.abspath(sys.executable)
+    tgt = _short_path(target)
+    src = _short_path(new_exe)
+    stem = os.path.join(tempfile.gettempdir(), "xlsx-deformula-update-%d" % os.getpid())
+    vbs = stem + ".vbs"
+    log = stem + ".log"
+    text = _vbs_update_script(src, tgt, log, version_tag)
+    with open(vbs, "w", encoding="utf-16", newline="\r\n") as f:
+        f.write(text)
+
+    flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
+             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    subprocess.Popen(["wscript.exe", "//nologo", vbs], close_fds=True,
+                     creationflags=flags,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return bat
+    return log
+
+
+def _vbs_update_script(src, tgt, log, version_tag=""):
+    """生成隐藏执行的 VBS 替换脚本（单独成函数便于自检）。"""
+    def q(p):
+        return '"%s"' % p.replace('"', '""')
+
+    lines = [
+        'Option Explicit',
+        'Dim fso, sh, i, ok, msg',
+        'Set fso = CreateObject("Scripting.FileSystemObject")',
+        'Set sh  = CreateObject("WScript.Shell")',
+        'Const SRC = %s' % q(src),
+        'Const TGT = %s' % q(tgt),
+        'Const LOG = %s' % q(log),
+        'Const VER = %s' % q(str(version_tag or "")),
+        '',
+        'Sub Say(s)',
+        '  On Error Resume Next',
+        '  Dim f: Set f = fso.OpenTextFile(LOG, 8, True)',
+        '  f.WriteLine Now & "  " & s',
+        '  f.Close',
+        'End Sub',
+        '',
+        'Say "update start, ver=" & VER',
+        'ok = False',
+        "' 直接覆盖复制：程序运行时目标 exe 被锁，CopyFile 会失败，正好当锁检测；",
+        "' 进程退出后第一轮就成功，不需要先删旧文件（避免替换失败把程序弄丢）。",
+        'For i = 1 To 60',
+        '  On Error Resume Next',
+        '  fso.CopyFile SRC, TGT, True',
+        '  If Err.Number = 0 Then',
+        '    If fso.GetFile(TGT).Size = fso.GetFile(SRC).Size Then ok = True',
+        '  End If',
+        '  Err.Clear',
+        '  If ok Then Exit For',
+        '  WScript.Sleep 1000',
+        'Next',
+        '',
+        'If ok Then',
+        '  On Error Resume Next',
+        '  fso.DeleteFile SRC, True',
+        '  Say "replaced ok after " & i & "s"',
+        '  sh.Run """" & TGT & """", 1, False',
+        '  Say "relaunched"',
+        'Else',
+        '  Say "FAILED after " & i & " tries"',
+        '  msg = "更新文件替换失败，可能原因：" & vbCrLf & _',
+        '        "· 程序仍在占用该文件（请手动关闭后重试）" & vbCrLf & _',
+        '        "· 当前目录没有写入权限（试着把程序放到桌面或文档目录）" & vbCrLf & vbCrLf & _',
+        '        "原程序会继续以旧版本启动。" & vbCrLf & _',
+        '        "日志：" & LOG',
+        '  MsgBox msg, 48, "Excel 公式转数值 - 更新未完成"',
+        '  On Error Resume Next',
+        '  sh.Run """" & TGT & """", 1, False',
+        'End If',
+        '',
+        'On Error Resume Next',
+        'fso.DeleteFile WScript.ScriptFullName, True',
+    ]
+    return "\r\n".join(lines) + "\r\n"
 
 
 def install_update(info, progress=None):
-    """下载 + 校验 + 安装。返回 (说明文字, 是否需要退出程序)。"""
+    """下载 + 校验 + 安装。返回 (说明文字, 是否需要退出并重启)。"""
     url, size_hint, sha_want, suffix = latest_payload(info)
     path, got, sha = _fetch(url, size_hint, sha_want, suffix, progress=progress)
     if is_frozen() and suffix == ".exe":
-        apply_exe_update(path, info.get("latest", ""))
-        return ("新版本 v%s 已下载（%.1f MB），程序将关闭并自动重启完成替换。"
-                % (info.get("latest"), got / 1048576.0)), True
+        log = apply_exe_update(path, info.get("latest", ""))
+        return ("新版本 v%s 已下载（%.1f MB）并校验通过。\n\n"
+                "程序将自动关闭 → 替换文件 → 重新启动，全程隐藏执行，不会弹出命令行窗口。\n"
+                "如 60 秒后仍未重启，更新日志在：\n%s"
+                % (info.get("latest"), got / 1048576.0, log)), True
     res = apply_source_update(path, info.get("latest", ""))
-    return ("已覆盖 %d 个程序文件%s。重新打开本程序即为 v%s。"
+    return ("已覆盖 %d 个程序文件%s。程序将自动重启以载入 v%s。"
             % (res["files"], ("（旧版本备份在 %s）" % res["backup"]) if res["backup"] else "",
-               info.get("latest"))), False
+               info.get("latest"))), True
 
 
 # ---------------------------------------------------------------- 图形界面
@@ -1362,6 +1420,26 @@ def run_gui(ui_check=False):
     def upd_status(text):
         ver_lbl.configure(text=text)
 
+    def relaunch_self():
+        """源码形态：更新完直接拉起新进程；exe 形态交给 VBS 替换脚本。"""
+        if is_frozen():
+            return
+        try:
+            subprocess.Popen([sys.executable, os.path.abspath(sys.argv[0])],
+                             cwd=program_dir(), close_fds=True,
+                             creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        except Exception:                                         # noqa: BLE001
+            traceback.print_exc()
+
+    def shutdown_and_exit():
+        """先销毁窗口再硬退出，保证文件锁立刻释放，替换脚本不会卡在等待。"""
+        try:
+            root.quit()
+            root.destroy()
+        except Exception:                                         # noqa: BLE001
+            pass
+        os._exit(0)
+
     def run_update(info):
         """（后台线程）下载 → 校验 → 安装。"""
         def prog(got, total):
@@ -1382,7 +1460,8 @@ def run_gui(ui_check=False):
         later(logln, "✔ " + msg)
         if need_exit:
             later(lambda: messagebox.showinfo(APP_NAME, msg))
-            later(lambda: (root.after(600, root.destroy)))
+            later(relaunch_self)
+            later(shutdown_and_exit)
         else:
             later(lambda: btn_upd.configure(state='normal', text="检查更新"))
             later(upd_status, "v%s" % APP_VER)

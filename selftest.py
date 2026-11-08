@@ -232,6 +232,22 @@ def test_update_engine():
             fails.append("更新把用户配置覆盖了")
         if not os.path.isdir(os.path.join(prog, '.update_backup')):
             fails.append("更新前没有备份旧文件")
+
+        # --- exe 自替换脚本：不能再依赖 cmd/tasklist，必须静默 + 失败有提示 ---
+        vbs = tool._vbs_update_script(r'C:\Temp\new.exe',
+                                      r'C:\App\ExcelFormulaToValue.exe',
+                                      r'C:\Temp\upd.log', '1.4')
+        for must in ('fso.CopyFile SRC, TGT, True',
+                     'WScript.Sleep 1000',
+                     'For i = 1 To 60',
+                     'fso.DeleteFile SRC, True',
+                     'MsgBox msg, 48'):
+            if must not in vbs:
+                fails.append("替换脚本缺少：%s" % must)
+        if 'cmd.exe' in vbs.lower() or 'tasklist' in vbs.lower():
+            fails.append("替换脚本仍依赖 cmd/tasklist")
+        if 'sh.Run """" & TGT & """", 1, False' not in vbs:
+            fails.append("替换后没有自动拉起新程序")
     finally:
         srv.shutdown()
         if old_env is None:
