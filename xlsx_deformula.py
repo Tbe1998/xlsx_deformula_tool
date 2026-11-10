@@ -43,14 +43,16 @@ import urllib.request
 from xml.sax.saxutils import escape
 
 APP_NAME = "Excel 公式转数值工具"
-APP_VER = "1.5"
+APP_VER = "1.5.1"
 APP_ID = "xlsx-deformula"
 SUFFIX = "_无公式"
 
 # 更新源（按序尝试）：家里的 NAS 镜像最快，公网 HTTPS 兜底
+LAN_ORIGIN = "http://192.168.1.6"
+PUBLIC_ORIGIN = "https://www.topbei.cn"
 DEFAULT_MANIFESTS = [
-    "http://192.168.1.6/download/%s/latest.json" % APP_ID,
-    "https://www.topbei.cn/download/%s/latest.json" % APP_ID,
+    LAN_ORIGIN + "/download/%s/latest.json" % APP_ID,
+    PUBLIC_ORIGIN + "/download/%s/latest.json" % APP_ID,
 ]
 UA = "XlsxDeformula/%s" % APP_VER
 
@@ -542,7 +544,7 @@ def download_file(url, dest, progress=None, timeout=60, size_hint=0):
                 os.remove(tmp)
         except OSError:
             pass
-        raise UpdateError("下载失败：%s" % e)
+        raise UpdateError("下载失败：%s" % _human_net_error(e))
     if got < 128:
         try:
             os.remove(tmp)
@@ -559,6 +561,46 @@ def download_file(url, dest, progress=None, timeout=60, size_hint=0):
         raise UpdateError("下载大小与清单不符（清单 %d 字节，实际 %d 字节），已拒绝安装"
                           % (int(size_hint), got))
     return got, h.hexdigest()
+
+
+def _mirror_urls(url):
+    """同一路径在局域网/公网两个镜像上的候选地址（先原地址，再换另一个源）。"""
+    out = [url]
+    if url.startswith(LAN_ORIGIN):
+        out.append(PUBLIC_ORIGIN + url[len(LAN_ORIGIN):])
+    elif url.startswith(PUBLIC_ORIGIN):
+        out.append(LAN_ORIGIN + url[len(PUBLIC_ORIGIN):])
+    return out
+
+
+def _human_net_error(e):
+    """把 WinError/errno 翻译成能照着排查的中文。"""
+    s = str(e)
+    low = s.lower()
+    if '10061' in s or 'refused' in low:
+        return ("目标计算机拒绝了连接（10061）：当前网络连不到这个下载源。"
+                "家里局域网才能用 192.168.1.6 那个地址；在外网请走公网源，"
+                "若公司/酒店网络只允许浏览器走代理，Python 直连也会被拒。")
+    if '10054' in s or 'reset' in low or 'eof' in low:
+        return "连接被重置（10054/SSL EOF）：多为网络中间设备拦截，换个网络再试。"
+    if 'timed out' in low or 'timeout' in low:
+        return "连接超时：网络不通或被防火墙丢包。"
+    if 'getaddrinfo' in low or 'name or service' in low:
+        return "域名解析失败：检查 DNS 或网络。"
+    return s
+
+
+def _fetch_any(url, size_hint, sha_want, suffix, progress=None):
+    """依次尝试局域网/公网两个镜像下载同一个文件；返回 (path, size, sha, 实际使用的地址)。"""
+    errors = []
+    for cand in _mirror_urls(url):
+        host = urllib.parse.urlparse(cand).netloc or cand
+        try:
+            dest, size, sha = _fetch(cand, size_hint, sha_want, suffix, progress=progress)
+            return dest, size, sha, cand
+        except Exception as e:                                    # noqa: BLE001
+            errors.append("%s → %s" % (host, e))
+    raise UpdateError("两个下载源都失败：\n" + "\n".join("  · " + x for x in errors))
 
 
 def _fetch(url, size_hint, sha_want, suffix, progress=None):
@@ -738,7 +780,10 @@ def _vbs_update_script(src, tgt, log, version_tag=""):
 def install_update(info, progress=None):
     """下载 + 校验 + 安装。返回 (说明文字, 是否需要退出并重启)。"""
     url, size_hint, sha_want, suffix = latest_payload(info)
-    path, got, sha = _fetch(url, size_hint, sha_want, suffix, progress=progress)
+    # 检查更新时用的镜像不一定还能下载（换网络/关 NAS/代理只放行浏览器）；
+    # 两个镜像都试一遍，别让用户卡在 WinError 10061。
+    path, got, sha, used = _fetch_any(url, size_hint, sha_want, suffix, progress=progress)
+    host = urllib.parse.urlparse(used).netloc
     try:
         if is_frozen() and suffix == ".exe":
             log = apply_exe_update(path, info.get("latest", ""))
@@ -748,9 +793,9 @@ def install_update(info, progress=None):
                     "如 60 秒后仍未重启，更新日志在：\n%s"
                     % (info.get("latest"), got / 1048576.0, log)), True
         res = apply_source_update(path, info.get("latest", ""))
-        return ("已覆盖 %d 个程序文件%s。程序将自动重启以载入 v%s。"
+        return ("已覆盖 %d 个程序文件%s。程序将自动重启以载入 v%s。\n下载源：%s"
                 % (res["files"], ("（旧版本备份在 %s）" % res["backup"]) if res["backup"] else "",
-                   info.get("latest"))), True
+                   info.get("latest"), host)), True
     finally:
         # 源码形态安装完就把临时包删掉，别在 %TEMP% 里越堆越多
         if suffix == ".zip":
