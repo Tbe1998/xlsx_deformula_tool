@@ -43,7 +43,7 @@ import urllib.request
 from xml.sax.saxutils import escape
 
 APP_NAME = "Excel 公式转数值工具"
-APP_VER = "1.4"
+APP_VER = "1.5"
 APP_ID = "xlsx-deformula"
 SUFFIX = "_无公式"
 
@@ -77,7 +77,9 @@ def _strip_f(block):
     """
     if '<f' not in block:
         return block, 0, 0, False
-    if DISPIMG_RE.search(_unescape(block)):
+    # 快路径：绝大多数公式块不含 DISPIMG，没必要为每个块都做一次反转义（大表里
+    # 有几十万个公式块，这一步是实打实的 CPU 开销）。
+    if 'DISPIMG' in block.upper() and DISPIMG_RE.search(_unescape(block)):
         return block, 0, 0, True
     new = F_RE.sub('', block)
     open_end = new.index('>')
@@ -112,7 +114,7 @@ def scan_workbook(path):
                 for blk in CELL_RE.findall(xml):
                     if '<f' not in blk:
                         continue
-                    if DISPIMG_RE.search(_unescape(blk)):
+                    if 'DISPIMG' in blk.upper() and DISPIMG_RE.search(_unescape(blk)):
                         keep_image += 1
                         continue
                     total += 1
@@ -162,42 +164,54 @@ def convert(src, dst, progress=None, keep_external=True):
                 stats['sheets'] += 1
 
     say("正在写入新文件…", 0.35)
+    out_dir = os.path.dirname(dst)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     tmp = dst + '.writing'
-    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
-        drop = {'xl/calcChain.xml'}
-        if not keep_external:
-            drop |= {n for n in zin.namelist()
-                     if n.startswith('xl/externalLinks/')}
-        total = len(zin.infolist())
-        for i, item in enumerate(zin.infolist()):
-            n = item.filename
-            if n in drop:
-                continue
-            data = zin.read(n)
-            if n in sheet_xml:
-                data = sheet_xml[n].encode('utf-8')
-            elif n == '[Content_Types].xml':
-                s = data.decode('utf-8', 'replace')
-                s = re.sub(r'<Override[^>]*calcChain\.xml"[^>]*/>', '', s)
-                if not keep_external:
-                    s = re.sub(r'<Override[^>]*externalLink\d*\.xml"[^>]*/>', '', s)
-                data = s.encode('utf-8')
-            elif n == 'xl/_rels/workbook.xml.rels':
-                s = data.decode('utf-8', 'replace')
-                s = re.sub(r'<Relationship[^>]*calcChain\.xml"[^>]*/>', '', s)
-                if not keep_external:
-                    s = re.sub(r'<Relationship[^>]*externalLink\d*\.xml"[^>]*/>', '', s)
-                data = s.encode('utf-8')
-            elif n == 'xl/workbook.xml':
-                s = data.decode('utf-8', 'replace')
-                s = s.replace(' fullCalcOnLoad="1"', '')
-                if not keep_external:
-                    s = re.sub(r'<externalReferences>.*?</externalReferences>', '', s, flags=re.S)
-                data = s.encode('utf-8')
-            zout.writestr(item, data)
-            if progress and i % 20 == 0:
-                say("正在写入新文件… (%d/%d)" % (i, total), 0.35 + 0.5 * i / max(total, 1))
-    shutil.move(tmp, dst)
+    try:
+        with zipfile.ZipFile(src) as zin, zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
+            drop = {'xl/calcChain.xml'}
+            if not keep_external:
+                drop |= {n for n in zin.namelist()
+                         if n.startswith('xl/externalLinks/')}
+            total = len(zin.infolist())
+            for i, item in enumerate(zin.infolist()):
+                n = item.filename
+                if n in drop:
+                    continue
+                data = zin.read(n)
+                if n in sheet_xml:
+                    data = sheet_xml[n].encode('utf-8')
+                elif n == '[Content_Types].xml':
+                    s = data.decode('utf-8', 'replace')
+                    s = re.sub(r'<Override[^>]*calcChain\.xml"[^>]*/>', '', s)
+                    if not keep_external:
+                        s = re.sub(r'<Override[^>]*externalLink\d*\.xml"[^>]*/>', '', s)
+                    data = s.encode('utf-8')
+                elif n == 'xl/_rels/workbook.xml.rels':
+                    s = data.decode('utf-8', 'replace')
+                    s = re.sub(r'<Relationship[^>]*calcChain\.xml"[^>]*/>', '', s)
+                    if not keep_external:
+                        s = re.sub(r'<Relationship[^>]*externalLink\d*\.xml"[^>]*/>', '', s)
+                    data = s.encode('utf-8')
+                elif n == 'xl/workbook.xml':
+                    s = data.decode('utf-8', 'replace')
+                    s = re.sub(r'\s*fullCalcOnLoad\s*=\s*"[^"]*"', '', s)
+                    if not keep_external:
+                        s = re.sub(r'<externalReferences>.*?</externalReferences>', '', s, flags=re.S)
+                    data = s.encode('utf-8')
+                zout.writestr(item, data)
+                if progress and i % 20 == 0:
+                    say("正在写入新文件… (%d/%d)" % (i, total), 0.35 + 0.5 * i / max(total, 1))
+        shutil.move(tmp, dst)
+    except Exception:
+        # 写一半失败不能留下 .writing 垃圾文件（旧版本会残留，下次还覆盖同名临时文件）
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
     say("正在自检…", 0.9)
     left = 0
@@ -227,11 +241,16 @@ def run_cli(argv):
         return 1
     src = argv[0]
     dst = argv[1] if len(argv) > 1 else default_out(src, None)
-    pre = scan_workbook(src)
-    print("源文件 : %s" % src)
-    print("工作表 : %d   公式单元格: %d   其中无缓存值: %d   内嵌图片单元格(保留不动): %d"
-          % (pre['sheets'], pre['formulas'], pre['no_cache'], pre['keep_image']))
-    st = convert(src, dst, progress=lambda m, f=None: print("  " + m))
+    try:
+        pre = scan_workbook(src)
+        print("源文件 : %s" % src)
+        print("工作表 : %d   公式单元格: %d   其中无缓存值: %d   内嵌图片单元格(保留不动): %d"
+              % (pre['sheets'], pre['formulas'], pre['no_cache'], pre['keep_image']))
+        st = convert(src, dst, progress=lambda m, f=None: print("  " + m))
+    except Exception as e:                                        # noqa: BLE001
+        # 命令行模式也别甩 traceback 给用户；退出码 2 表示业务失败
+        print("处理失败：%s" % e, file=sys.stderr)
+        return 2
     print("输出   : %s" % dst)
     print("结果   : 剥离公式 %d 个 / 文本转换 %d / 保留图片单元格 %d 个 / 耗时 %.1fs"
           % (st['formulas'], st['text'], st['keep_image'], st['seconds']))
@@ -409,7 +428,9 @@ def _ascii_url(url):
 
 def http_json(url, timeout=8):
     req = urllib.request.Request(_ascii_url(url), headers={
-        "User-Agent": UA, "Accept": "application/json, */*", "Cache-Control": "no-cache"})
+        "User-Agent": UA, "Accept": "application/json, */*",
+        # 不要 gzip：urllib 不会自动解压，NAS/反代一开压缩就解析失败
+        "Accept-Encoding": "identity", "Cache-Control": "no-cache"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read()
@@ -495,7 +516,7 @@ def check_latest(custom=None, timeout=8):
     raise UpdateError("所有更新源都连不上：\n" + "\n".join("  · " + x for x in errors))
 
 
-def download_file(url, dest, progress=None, timeout=60):
+def download_file(url, dest, progress=None, timeout=60, size_hint=0):
     """下载并实时算 sha256，返回 (字节数, sha256)。"""
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     tmp = dest + ".part"
@@ -529,13 +550,21 @@ def download_file(url, dest, progress=None, timeout=60):
             pass
         raise UpdateError("下载文件过小（%d 字节），可能被网络拦截" % got)
     os.replace(tmp, dest)
+    # 清单给了字节数就核对：截断/被注入 HTML 的下载即使没有 sha256 也能挡住
+    if size_hint and got != int(size_hint):
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        raise UpdateError("下载大小与清单不符（清单 %d 字节，实际 %d 字节），已拒绝安装"
+                          % (int(size_hint), got))
     return got, h.hexdigest()
 
 
 def _fetch(url, size_hint, sha_want, suffix, progress=None):
     dest = os.path.join(tempfile.gettempdir(),
                         "xlsx-deformula-update-%d%s" % (os.getpid(), suffix))
-    size, sha = download_file(url, dest, progress=progress)
+    size, sha = download_file(url, dest, progress=progress, size_hint=size_hint)
     if sha_want and sha != sha_want:
         try:
             os.remove(dest)
@@ -571,6 +600,9 @@ def apply_source_update(zip_path, version_tag=""):
                 if m.is_dir():
                     continue
                 if name.startswith("/") or ".." in name.split("/"):
+                    raise UpdateError("安装包里有非法路径：%s" % name)
+                # Windows 盘符（C:/…）会被 os.path.join 当成绝对路径，写到程序目录之外
+                if re.match(r"^[A-Za-z]:", name) or name.startswith("\\\\"):
                     raise UpdateError("安装包里有非法路径：%s" % name)
             tops = {n.split("/")[0] for n in names}
             prefix = (tops.pop() + "/") if len(tops) == 1 and any("/" in n for n in names) else ""
@@ -707,16 +739,26 @@ def install_update(info, progress=None):
     """下载 + 校验 + 安装。返回 (说明文字, 是否需要退出并重启)。"""
     url, size_hint, sha_want, suffix = latest_payload(info)
     path, got, sha = _fetch(url, size_hint, sha_want, suffix, progress=progress)
-    if is_frozen() and suffix == ".exe":
-        log = apply_exe_update(path, info.get("latest", ""))
-        return ("新版本 v%s 已下载（%.1f MB）并校验通过。\n\n"
-                "程序将自动关闭 → 替换文件 → 重新启动，全程隐藏执行，不会弹出命令行窗口。\n"
-                "如 60 秒后仍未重启，更新日志在：\n%s"
-                % (info.get("latest"), got / 1048576.0, log)), True
-    res = apply_source_update(path, info.get("latest", ""))
-    return ("已覆盖 %d 个程序文件%s。程序将自动重启以载入 v%s。"
-            % (res["files"], ("（旧版本备份在 %s）" % res["backup"]) if res["backup"] else "",
-               info.get("latest"))), True
+    try:
+        if is_frozen() and suffix == ".exe":
+            log = apply_exe_update(path, info.get("latest", ""))
+            # exe 由 VBS 复制后自行删除；这里不删，避免替换过程中源文件先没了
+            return ("新版本 v%s 已下载（%.1f MB）并校验通过。\n\n"
+                    "程序将自动关闭 → 替换文件 → 重新启动，全程隐藏执行，不会弹出命令行窗口。\n"
+                    "如 60 秒后仍未重启，更新日志在：\n%s"
+                    % (info.get("latest"), got / 1048576.0, log)), True
+        res = apply_source_update(path, info.get("latest", ""))
+        return ("已覆盖 %d 个程序文件%s。程序将自动重启以载入 v%s。"
+                % (res["files"], ("（旧版本备份在 %s）" % res["backup"]) if res["backup"] else "",
+                   info.get("latest"))), True
+    finally:
+        # 源码形态安装完就把临时包删掉，别在 %TEMP% 里越堆越多
+        if suffix == ".zip":
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
 
 
 # ---------------------------------------------------------------- 图形界面
@@ -773,6 +815,30 @@ def run_gui(ui_check=False):
     root.geometry("900x800")
     root.minsize(780, 640)
     root.configure(bg=BG)
+
+    # ---- 线程安全 UI 通道 -------------------------------------------
+    # tkinter 只能在主线程操作控件。转换/更新跑在后台线程里，任何控件读写都
+    # 必须投递到队列，由主线程 pump() 执行；否则 Windows 上会偶发卡死或
+    # 报 "main thread is not in main loop"。root.after 在子线程里同样不可靠。
+    ui_q = queue.Queue()
+
+    def later(fn, *a):
+        ui_q.put((fn, a))
+
+    def on_main():
+        return threading.current_thread() is threading.main_thread()
+
+    def pump():
+        while True:
+            try:
+                fn, a = ui_q.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn(*a)
+            except Exception:                                     # noqa: BLE001
+                traceback.print_exc()
+        root.after(120, pump)
 
     # 选一个带中文的界面字体（Windows 用微软雅黑，其余平台依次回退）
     FAM = 'TkDefaultFont'
@@ -1102,6 +1168,10 @@ def run_gui(ui_check=False):
     log_holder = {}
 
     def logln(s):
+        # 后台线程（转换/更新）调用时投递回主线程，别直接碰 Text 控件
+        if not on_main():
+            later(logln, s)
+            return
         box = log_holder.get('box')
         if box is None:
             return
@@ -1291,6 +1361,9 @@ def run_gui(ui_check=False):
     log_holder['box'] = log_box
 
     def set_prog(frac):
+        if not on_main():
+            later(set_prog, frac)
+            return
         bar['value'] = max(0, min(1, frac)) * 100
 
     def history_values():
@@ -1351,16 +1424,19 @@ def run_gui(ui_check=False):
             set_prog(1.0)
             logln("=" * 60)
             logln("全部完成：成功 %d / %d。原始文件均未改动。" % (ok, len(pairs)))
-            messagebox.showinfo(APP_NAME, "处理完成：成功 %d / %d 个文件。\n\n原始文件未作任何修改。"
-                                % (ok, len(pairs)))
+            later(messagebox.showinfo, APP_NAME,
+                  "处理完成：成功 %d / %d 个文件。\n\n原始文件未作任何修改。" % (ok, len(pairs)))
         except Exception as e:
             logln("✘ 出错：%s" % e)
             logln(traceback.format_exc())
-            messagebox.showerror(APP_NAME, "处理失败：\n%s" % e)
+            later(messagebox.showerror, APP_NAME, "处理失败：\n%s" % e)
         finally:
             running['v'] = False
-            btn_run.configure(state='normal')
-            btn_open.configure(state='normal')
+            later(restore_buttons)
+
+    def restore_buttons():
+        btn_run.configure(state='normal')
+        btn_open.configure(state='normal')
 
     def start():
         if running['v']:
@@ -1399,23 +1475,6 @@ def run_gui(ui_check=False):
 
     # ---------- 更新（手动检查 + 启动静默检查） ----------
     upd = {'info': None, 'busy': False}
-    ui_q = queue.Queue()
-
-    def later(fn, *a):
-        """后台线程不能直接碰 Tk（会静默失效/崩），一律投递到主线程的队列。"""
-        ui_q.put((fn, a))
-
-    def pump():
-        while True:
-            try:
-                fn, a = ui_q.get_nowait()
-            except queue.Empty:
-                break
-            try:
-                fn(*a)
-            except Exception:                                     # noqa: BLE001
-                traceback.print_exc()
-        root.after(120, pump)
 
     def upd_status(text):
         ver_lbl.configure(text=text)
